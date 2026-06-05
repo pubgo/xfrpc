@@ -52,3 +52,4 @@ build
 test/iod_client
 test/iod_server
 test_iod_proto
+.local
