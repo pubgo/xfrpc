@@ -67,6 +67,23 @@ pub fn build(b: *std.Build) void {
 
     const os_tag = target.result.os.tag;
 
+    // When building for macOS we need the system SDK headers (e.g.
+    // <arpa/telnet.h>, which Zig's bundled libc headers do not ship). For a
+    // native build Zig finds the SDK automatically, but as soon as an explicit
+    // -Dtarget is given (e.g. cross-compiling x86_64 on an Apple Silicon
+    // runner) it falls back to its own headers. In that case set SDKROOT, e.g.
+    //   export SDKROOT=$(xcrun --show-sdk-path)
+    // and we add the SDK include/lib/framework paths from it.
+    if (os_tag == .macos) {
+        if (b.graph.environ_map.get("SDKROOT")) |sdk| {
+            if (sdk.len > 0) {
+                mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
+                mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+                mod.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+            }
+        }
+    }
+
     // On macOS, dependencies are typically installed via Homebrew. Add the
     // common Apple Silicon (/opt/homebrew) and Intel (/usr/local) prefixes so
     // headers/libs are found. Non-existent dirs only yield a harmless warning.
