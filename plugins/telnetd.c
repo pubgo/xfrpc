@@ -51,6 +51,12 @@
 #include "telnetd.h"
 #include "../debug.h"
 
+/* XTABS (expand tabs to spaces on output) is a Linux/BSD termios flag that is
+ * not defined on all platforms (e.g. macOS uses OXTABS). Fall back to 0. */
+#ifndef XTABS
+#define XTABS 0
+#endif
+
 
 typedef struct sockaddr_in sockaddr_type;
 static const char *loginpath = "/bin/login";
@@ -247,9 +253,9 @@ send_iac(struct tsession *ts, unsigned char command, int option)
 {
 	/* We rely on that there is space in the buffer for now.  */
 	char *b = ts->buf2 + ts->rdidx2;
-	*b++ = IAC;
-	*b++ = command;
-	*b++ = option;
+	*b++ = (char)IAC;
+	*b++ = (char)command;
+	*b++ = (char)option;
 	ts->rdidx2 += 3;
 	ts->size2 += 3;
 }
@@ -332,8 +338,7 @@ make_new_session(int sockfd)
 
 		tcgetattr(0, &termbuf);
 		termbuf.c_lflag |= ECHO; /* if we use readline we dont want this */
-		termbuf.c_oflag |= ONLCR | XTABS;
-		termbuf.c_iflag |= ICRNL;
+		termbuf.c_oflag |= ONLCR | XTABS;		termbuf.c_iflag |= ICRNL;
 		termbuf.c_iflag &= ~IXOFF;
 		/*termbuf.c_lflag &= ~ICANON;*/
 		tcsetattr(0, TCSANOW, &termbuf);

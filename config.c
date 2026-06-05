@@ -12,8 +12,10 @@
 #include <ctype.h>
 #include <sys/types.h>
 #include <pwd.h>
+#ifdef __linux__
 #include <shadow.h>
 #include <crypt.h>
+#endif
 
 #include "ini.h"
 #include "uthash.h"
