@@ -152,6 +152,14 @@ file zig-out/bin/xfrpc          # ELF 64-bit ... statically linked, stripped
 The resulting `ReleaseSmall` static binary is roughly 3.5 MB (mostly the
 bundled OpenSSL) and runs on any matching Linux kernel without extra libraries.
 
+Optionally compress it further with [UPX](https://upx.github.io/). This roughly
+two-thirds the on-disk size at the cost of a tiny self-extraction step at
+startup (handy for flash-constrained OpenWrt / embedded targets):
+
+```shell
+upx --best --lzma zig-out/bin/xfrpc   # ~3.5 MB -> ~1.15 MB
+```
+
 ### Build static binary in Alpine container
 
 Under project root directory
