@@ -160,6 +160,15 @@ startup (handy for flash-constrained OpenWrt / embedded targets):
 upx --best --lzma zig-out/bin/xfrpc   # ~3.5 MB -> ~1.15 MB
 ```
 
+Pushing a `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which builds these static binaries for `linux_amd64`, `linux_arm64` and
+`linux_armv7` (UPX-compressed on stable tags) and publishes them as a GitHub
+Release. Tags containing `-alpha` / `-beta` are published as pre-releases.
+
+```shell
+git tag v5.06.916 && git push origin v5.06.916
+```
+
 ### Build static binary in Alpine container
 
 Under project root directory

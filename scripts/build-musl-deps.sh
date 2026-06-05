@@ -38,6 +38,20 @@ case "$TARGET" in
 esac
 CMAKE_PROCESSOR="${TARGET%%-*}"
 
+# Idempotent short-circuit: if every dep is already present (e.g. a restored CI
+# cache), skip the (slow) rebuild. Set FORCE=1 to rebuild from scratch.
+have_all_libs() {
+  [ -f "$SYSROOT/lib/libz.a" ] &&
+  [ -f "$SYSROOT/lib/libevent.a" ] &&
+  [ -f "$SYSROOT/lib/libjson-c.a" ] &&
+  { [ -f "$SYSROOT/lib/libssl.a" ] || [ -f "$SYSROOT/lib64/libssl.a" ]; } &&
+  { [ -f "$SYSROOT/lib/libcrypto.a" ] || [ -f "$SYSROOT/lib64/libcrypto.a" ]; }
+}
+if [ "${FORCE:-0}" != "1" ] && have_all_libs; then
+  echo ">>> deps already built for $TARGET at $SYSROOT (set FORCE=1 to rebuild)"
+  exit 0
+fi
+
 rm -rf "$SYSROOT"
 mkdir -p "$SYSROOT" "$SRC" "$TC"
 

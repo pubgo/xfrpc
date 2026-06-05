@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
         for ([_][]const u8{ "pthread", "m", "dl" }) |lib| {
             mod.linkSystemLibrary(lib, .{ .use_pkg_config = .no, .preferred_link_mode = link_mode });
         }
-        if (target.result.abi != .musl) {
+        if (!target.result.abi.isMusl()) {
             mod.linkSystemLibrary("crypt", .{ .use_pkg_config = .no, .preferred_link_mode = link_mode });
         }
     }
