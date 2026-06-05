@@ -12,21 +12,21 @@ xfrpc partially compitable with latest frp release feature, It targets to fully 
 
 the following table is detail  compatible feature:
 
-| Feature  | xfrpc | frpc |
-| ------------- | ------------- | ---------|
-| tcp  | Yes |	 Yes  |
-| tcpmux  | Yes |	 Yes  |
-| http  | Yes |	 Yes  |
-| https  | Yes |  Yes  |
-| custom_domains | Yes | Yes |
-| subdomain | Yes | Yes |
-| socks5 | Yes | No |
-| use_encryption | No | Yes |
-| use_compression | No | Yes |
-| udp  | No |  Yes  |
-| p2p  | No |  Yes  |
-| xtcp  | No |  Yes  |
-| stcp  | No |  Yes  |
+| Feature         | xfrpc | frpc |
+| --------------- | ----- | ---- |
+| tcp             | Yes   | Yes  |
+| tcpmux          | Yes   | Yes  |
+| http            | Yes   | Yes  |
+| https           | Yes   | Yes  |
+| custom_domains  | Yes   | Yes  |
+| subdomain       | Yes   | Yes  |
+| socks5          | Yes   | No   |
+| use_encryption  | No    | Yes  |
+| use_compression | No    | Yes  |
+| udp             | No    | Yes  |
+| p2p             | No    | Yes  |
+| xtcp            | No    | Yes  |
+| stcp            | No    | Yes  |
 
 
 
@@ -112,6 +112,45 @@ cmake ..
 make
 ```
 This will compile xfrpc and create an executable in the build directory. You can then run xfrpc using the executable by running the appropriate command in terminal.
+
+### Build with Zig (macOS / Linux, optional fully-static binary)
+
+[`build.zig`](build.zig) provides an alternative to CMake that works on macOS
+and Linux and can cross-compile a **fully static** Linux binary (zero runtime
+dependencies, ideal for OpenWrt / containers). Requires [Zig](https://ziglang.org/) >= 0.16.
+
+Native build (uses the system / Homebrew copies of OpenSSL, libevent, json-c, zlib):
+
+```shell
+zig build                       # debug build -> zig-out/bin/xfrpc
+zig build -Doptimize=ReleaseSmall
+./zig-out/bin/xfrpc -v
+```
+
+On macOS the script auto-detects Homebrew prefixes (`openssl@3`, `libevent`,
+`json-c`, `zlib`). If your dependencies live elsewhere, point to them with
+`-Ddep-prefix=<install-root>`.
+
+Fully static Linux binary via cross-compilation. First build the dependencies
+as musl static libraries (downloads + builds zlib, OpenSSL, libevent, json-c
+into a sysroot under `~/.cache/xfrpc-musl`):
+
+```shell
+scripts/build-musl-deps.sh                       # x86_64-linux-musl
+# TARGET=aarch64-linux-musl scripts/build-musl-deps.sh   # other arches
+```
+
+Then link xfrpc against that sysroot:
+
+```shell
+zig build -Dtarget=x86_64-linux-musl \
+          -Ddep-prefix="$HOME/.cache/xfrpc-musl/sysroot" \
+          -Doptimize=ReleaseSmall -Dstatic
+file zig-out/bin/xfrpc          # ELF 64-bit ... statically linked, stripped
+```
+
+The resulting `ReleaseSmall` static binary is roughly 3.5 MB (mostly the
+bundled OpenSSL) and runs on any matching Linux kernel without extra libraries.
 
 ### Build static binary in Alpine container
 
