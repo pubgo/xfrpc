@@ -26,6 +26,12 @@ pub fn build(b: *std.Build) void {
     // -Dtarget=x86_64-linux-musl -Dstatic).
     const force_static = b.option(bool, "static", "Link the executable fully statically") orelse false;
 
+    // Link the C dependencies (openssl/libevent/json-c/zlib) statically while
+    // keeping the executable itself dynamic. macOS cannot link libSystem
+    // statically, so this is the way to produce a portable macOS binary that
+    // does not require Homebrew at runtime.
+    const dep_static = b.option(bool, "dep-static", "Statically link the C dependencies but keep the executable dynamic") orelse false;
+
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -64,7 +70,10 @@ pub fn build(b: *std.Build) void {
     // On macOS, dependencies are typically installed via Homebrew. Add the
     // common Apple Silicon (/opt/homebrew) and Intel (/usr/local) prefixes so
     // headers/libs are found. Non-existent dirs only yield a harmless warning.
-    if (os_tag == .macos) {
+    // When an explicit dep-prefix is given (e.g. a static sysroot built by
+    // scripts/build-macos-deps.sh) we skip Homebrew so that prefix is the sole,
+    // authoritative source of the dependencies.
+    if (os_tag == .macos and dep_prefix == null) {
         const brew_opt = [_][]const u8{ "/opt/homebrew/opt", "/usr/local/opt" };
         const pkgs = [_][]const u8{ "openssl@3", "libevent", "json-c", "zlib" };
         for (brew_opt) |root| {
@@ -83,7 +92,7 @@ pub fn build(b: *std.Build) void {
         mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib64", .{prefix}) });
     }
 
-    const link_mode: std.builtin.LinkMode = if (force_static) .static else .dynamic;
+    const link_mode: std.builtin.LinkMode = if (force_static or dep_static) .static else .dynamic;
 
     // External libraries (required on every target).
     // Disable pkg-config: it resolves libevent_openssl's dependency on libevent

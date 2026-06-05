@@ -160,10 +160,22 @@ startup (handy for flash-constrained OpenWrt / embedded targets):
 upx --best --lzma zig-out/bin/xfrpc   # ~3.5 MB -> ~1.15 MB
 ```
 
+On macOS, a portable binary (deps linked statically, only the system libSystem
+left dynamic — no Homebrew needed at runtime) is built with
+[`scripts/build-macos-deps.sh`](scripts/build-macos-deps.sh) and `-Ddep-static`:
+
+```shell
+ARCH=arm64 scripts/build-macos-deps.sh        # or ARCH=x86_64
+zig build -Ddep-prefix="$HOME/.cache/xfrpc-macos/arm64/sysroot" \
+          -Doptimize=ReleaseSmall -Ddep-static
+otool -L zig-out/bin/xfrpc                     # -> only /usr/lib/libSystem.B.dylib
+```
+
 Pushing a `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which builds these static binaries for `linux_amd64`, `linux_arm64` and
-`linux_armv7` (UPX-compressed on stable tags) and publishes them as a GitHub
-Release. Tags containing `-alpha` / `-beta` are published as pre-releases.
+which builds static binaries for `linux_amd64`, `linux_arm64`, `linux_armv7`
+(UPX-compressed on stable tags) plus portable `darwin_amd64` / `darwin_arm64`,
+and publishes them as a GitHub Release. Tags containing `-alpha` / `-beta` are
+published as pre-releases.
 
 ```shell
 git tag v5.06.916 && git push origin v5.06.916
