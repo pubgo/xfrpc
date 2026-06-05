@@ -168,8 +168,21 @@ left dynamic — no Homebrew needed at runtime) is built with
 ARCH=arm64 scripts/build-macos-deps.sh        # or ARCH=x86_64
 zig build -Ddep-prefix="$HOME/.cache/xfrpc-macos/arm64/sysroot" \
           -Doptimize=ReleaseSmall -Ddep-static
-otool -L zig-out/bin/xfrpc                     # -> only /usr/lib/libSystem.B.dylib
+otool -L zig-out/bin/xfrpc                     # -> only system libSystem / libz
 ```
+
+To cross-compile the other architecture (e.g. an `x86_64` binary on an Apple
+Silicon machine), add `-Dtarget=` and export `SDKROOT` so the SDK headers
+resolve:
+
+```shell
+ARCH=x86_64 scripts/build-macos-deps.sh
+export SDKROOT="$(xcrun --show-sdk-path)"
+zig build -Dtarget=x86_64-macos \
+          -Ddep-prefix="$HOME/.cache/xfrpc-macos/x86_64/sysroot" \
+          -Doptimize=ReleaseSmall -Ddep-static
+```
+
 
 Pushing a `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which builds static binaries for `linux_amd64`, `linux_arm64`, `linux_armv7`

@@ -92,22 +92,24 @@ jobs:
                   name: xfrpc-${{ matrix.label }}
                   path: release-artifacts/*.tar.gz
 
-    # Build a portable macOS binary per arch on its native runner (no cross
-    # compile, so the system SDK headers are available). The C deps are linked
-    # statically via -Ddep-static; only libSystem stays dynamic, so the binary
-    # runs without Homebrew.
+    # Build a portable macOS binary per arch. GitHub's Intel macOS runners
+    # (macos-13) are deprecated, so both arches are built on the arm64 runner
+    # (macos-14) and the x86_64 binary is cross-compiled. Setting SDKROOT lets
+    # the cross build find the system SDK headers (e.g. <arpa/telnet.h>). The C
+    # deps are linked statically via -Ddep-static; only system libraries
+    # (libSystem/libz) stay dynamic, so the binary runs without Homebrew.
     build-macos:
         strategy:
             fail-fast: false
             matrix:
                 include:
-                    - runner: macos-13
-                      arch: x86_64
+                    - arch: x86_64
+                      zig_target: x86_64-macos
                       label: darwin_amd64
-                    - runner: macos-14
-                      arch: arm64
+                    - arch: arm64
+                      zig_target: aarch64-macos
                       label: darwin_arm64
-        runs-on: ${{ matrix.runner }}
+        runs-on: macos-14
         steps:
             - uses: actions/checkout@v4
               with:
@@ -148,13 +150,19 @@ jobs:
                   else
                     optimize="ReleaseSafe"
                   fi
-                  echo "Channel: ${channel}, Optimize: ${optimize}, Arch: ${{ matrix.arch }}"
-                  # Native build (no -Dtarget) so the macOS SDK headers resolve.
+                  # SDKROOT lets the cross build resolve the macOS SDK headers.
+                  export SDKROOT="$(xcrun --show-sdk-path)"
+                  echo "Channel: ${channel}, Optimize: ${optimize}, Target: ${{ matrix.zig_target }}, SDKROOT: ${SDKROOT}"
                   zig build \
+                    -Dtarget=${{ matrix.zig_target }} \
                     -Ddep-prefix="$HOME/.cache/xfrpc-macos/${{ matrix.arch }}/sysroot" \
                     -Doptimize="${optimize}" -Ddep-static
+                  file zig-out/bin/xfrpc
                   otool -L zig-out/bin/xfrpc
-                  ./zig-out/bin/xfrpc -v
+                  # The x86_64 binary cannot run on the arm64 runner.
+                  if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+                    ./zig-out/bin/xfrpc -v
+                  fi
 
             - name: Package artifact
               run: |
