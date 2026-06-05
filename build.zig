@@ -22,6 +22,10 @@ pub fn build(b: *std.Build) void {
         "Extra dependency prefix providing include/ and lib/ for openssl, libevent, json-c, zlib",
     );
 
+    // Force a fully static executable (recommended with a musl target, e.g.
+    // -Dtarget=x86_64-linux-musl -Dstatic).
+    const force_static = b.option(bool, "static", "Link the executable fully statically") orelse false;
+
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -75,7 +79,11 @@ pub fn build(b: *std.Build) void {
     if (dep_prefix) |prefix| {
         mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
         mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+        // OpenSSL (and some distros) install 64-bit libs under lib64.
+        mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib64", .{prefix}) });
     }
+
+    const link_mode: std.builtin.LinkMode = if (force_static) .static else .dynamic;
 
     // External libraries (required on every target).
     // Disable pkg-config: it resolves libevent_openssl's dependency on libevent
@@ -90,13 +98,18 @@ pub fn build(b: *std.Build) void {
         "z",
     };
     for (ext_libs) |lib| {
-        mod.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
+        mod.linkSystemLibrary(lib, .{ .use_pkg_config = .no, .preferred_link_mode = link_mode });
     }
 
     // System libraries that are separate on Linux but part of libc elsewhere.
+    // On musl they all live in libc; `crypt` has no stub archive, so skip it
+    // there (the rest are provided as empty stubs by Zig).
     if (os_tag == .linux) {
-        for ([_][]const u8{ "pthread", "m", "crypt", "dl" }) |lib| {
-            mod.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
+        for ([_][]const u8{ "pthread", "m", "dl" }) |lib| {
+            mod.linkSystemLibrary(lib, .{ .use_pkg_config = .no, .preferred_link_mode = link_mode });
+        }
+        if (target.result.abi != .musl) {
+            mod.linkSystemLibrary("crypt", .{ .use_pkg_config = .no, .preferred_link_mode = link_mode });
         }
     }
 
@@ -104,6 +117,7 @@ pub fn build(b: *std.Build) void {
         .name = "xfrpc",
         .root_module = mod,
     });
+    if (force_static) exe.linkage = .static;
     b.installArtifact(exe);
 
     // `zig build run -- <args>`
