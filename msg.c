@@ -219,6 +219,20 @@ char *get_auth_key(const char *token, time_t *timestamp)
 	return auth_key;
 }
 
+int common_conf_uses_jwt_auth(const struct common_conf *cf)
+{
+	if (!cf) {
+		return 0;
+	}
+	if (cf->auth_method && strcmp(cf->auth_method, "jwt") == 0) {
+		return 1;
+	}
+	if (cf->auth_token && strncmp(cf->auth_token, "eyJ", 3) == 0) {
+		return 1;
+	}
+	return 0;
+}
+
 /**
  * @brief Marshals login request data into a JSON string
  *
@@ -240,9 +254,19 @@ size_t login_request_marshal(char **msg)
 		return 0;
 	}
 
-	// Generate new auth key
+	// Generate auth key / JWT privilege key
 	struct common_conf *cf = get_common_config();
-	char *auth_key = get_auth_key(cf->auth_token, &lg->timestamp);
+	char *auth_key = NULL;
+	if (common_conf_uses_jwt_auth(cf)) {
+		if (!cf->auth_token || !*cf->auth_token) {
+			json_object_put(j_login_req);
+			return 0;
+		}
+		lg->timestamp = time(NULL);
+		auth_key = strdup(cf->auth_token);
+	} else {
+		auth_key = get_auth_key(cf->auth_token, &lg->timestamp);
+	}
 	if (!auth_key) {
 		json_object_put(j_login_req);
 		return 0;
@@ -395,6 +419,14 @@ int new_proxy_service_marshal(const struct proxy_service *np_req, char **msg)
 	JSON_MARSHAL_TYPE(j_np_req, "host_header_rewrite", string, SAFE_JSON_STRING(np_req->host_header_rewrite));
 	JSON_MARSHAL_TYPE(j_np_req, "http_user", string, SAFE_JSON_STRING(np_req->http_user));
 	JSON_MARSHAL_TYPE(j_np_req, "http_pwd", string, SAFE_JSON_STRING(np_req->http_pwd));
+
+	if (np_req->http_referer && *np_req->http_referer) {
+		struct json_object *headers = json_object_new_object();
+		if (headers) {
+			json_object_object_add(headers, "Referer", json_object_new_string(np_req->http_referer));
+			json_object_object_add(j_np_req, "request_headers", headers);
+		}
+	}
 
 	// Add TCPMux specific fields
 	if (strcmp(proxy_type, "tcpmux") == 0) {

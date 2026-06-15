@@ -36,6 +36,8 @@ struct common_conf {
 	/* Server settings */
 	char    *server_addr;          /* default 127.0.0.1 */
 	int     server_port;           /* default 7000 */
+	char    *user;                 /* frp login user (required for JWT) */
+	char    *auth_method;          /* "token" or "jwt" */
 	char    *auth_token;
 
 	/* Connection settings */
@@ -58,6 +60,12 @@ struct common_conf {
 struct common_conf *get_common_config(void);
 void free_common_config(void);
 void load_config(const char *confile);
+int config_is_toml_path(const char *confile);
+struct proxy_service *config_create_proxy(const char *name);
+int config_set_proxy_field(struct proxy_service *ps, const char *key, const char *value);
+int config_set_common_field(struct common_conf *config, const char *key, const char *value);
+void load_toml_config(const char *confile);
+int common_conf_uses_jwt_auth(const struct common_conf *cf);
 
 /* Proxy service management functions */
 struct proxy_service *get_proxy_service(const char *proxy_name);

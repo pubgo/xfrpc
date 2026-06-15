@@ -40,10 +40,11 @@ pub fn build(b: *std.Build) void {
 
     const sources = [_][]const u8{
         // core
-        "main.c",        "client.c",    "config.c",   "control.c",
+        "main.c",        "client.c",    "config.c",   "config_toml.c", "control.c",
         "ini.c",         "msg.c",       "xfrpc.c",    "debug.c",
         "zip.c",         "commandline.c", "crypto.c", "fastpbkdf2.c",
         "utils.c",       "common.c",    "login.c",    "tls.c",
+        "third_party/tomlc99/toml.c",
         // proxy
         "proxy_tcp.c",   "proxy_udp.c", "proxy_ftp.c", "proxy.c",
         "tcpmux.c",      "tcp_redir.c", "mongoose.c",
@@ -64,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .flags = cflags,
     });
     mod.addIncludePath(b.path("."));
+    mod.addIncludePath(b.path("third_party/tomlc99"));
 
     const os_tag = target.result.os.tag;
 
