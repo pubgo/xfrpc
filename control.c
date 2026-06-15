@@ -484,8 +484,18 @@ struct bufferevent *connect_server(struct event_base *base, const char *name, co
 		return NULL;
 	}
 
-	// Create new bufferevent socket
-	struct bufferevent *bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+	// Create bufferevent socket (TLS-aware for frps control connection)
+	struct bufferevent *bev = NULL;
+	if (tls_is_enabled()) {
+		struct common_conf *c_conf = get_common_config();
+		if (c_conf && strcmp(name, c_conf->server_addr) == 0 && port == c_conf->server_port) {
+			debug(LOG_DEBUG, "Creating TLS connection to %s:%d", name, port);
+			bev = tls_bev_socket_new(base);
+		}
+	}
+	if (!bev) {
+		bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+	}
 	if (!bev) {
 		debug(LOG_ERR, "Failed to create new bufferevent socket");
 		return NULL;
@@ -525,25 +535,6 @@ struct bufferevent *connect_server(struct event_base *base, const char *name, co
 	if (fd >= 0) {
 		int one = 1;
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-	}
-
-	// Wrap with TLS if enabled AND target is the frps server
-	{
-		int _tls_on = tls_is_enabled();
-		debug(LOG_DEBUG, "TLS check: tls_is_enabled=%d, name=%s, port=%d", _tls_on, name, port);
-	}
-	if (tls_is_enabled()) {
-		struct common_conf *c_conf = get_common_config();
-		if (c_conf && strcmp(name, c_conf->server_addr) == 0 && port == c_conf->server_port) {
-			debug(LOG_DEBUG, "TLS wrapping connection to %s:%d", name, port);
-			struct bufferevent *ssl_bev = tls_wrap_bev(base, bev);
-			if (!ssl_bev) {
-				debug(LOG_ERR, "Failed to wrap connection with TLS");
-				/* bev was consumed/freed by tls_wrap_bev on failure */
-				return NULL;
-			}
-			return ssl_bev;
-		}
 	}
 
 	return bev;

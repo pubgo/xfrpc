@@ -138,6 +138,80 @@ int tls_init(void)
 	return 0;
 }
 
+static void tls_configure_ssl(SSL *ssl)
+{
+	if (!ssl) {
+		return;
+	}
+
+	struct common_conf *conf = get_common_config();
+	if (!conf) {
+		return;
+	}
+
+	const char *sni_host = conf->tls_server_name ? conf->tls_server_name : conf->server_addr;
+	if (sni_host && !conf->tls_server_name) {
+		struct in_addr addr;
+		if (inet_pton(AF_INET, sni_host, &addr) != 1) {
+			SSL_set_tlsext_host_name(ssl, sni_host);
+			debug(LOG_DEBUG, "[TLS] SNI set to: %s", sni_host);
+		}
+	} else if (conf->tls_server_name) {
+		SSL_set_tlsext_host_name(ssl, conf->tls_server_name);
+		debug(LOG_DEBUG, "[TLS] SNI set to: %s", conf->tls_server_name);
+	}
+
+	SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+	if (sni_host) {
+		struct in_addr addr4;
+		struct in6_addr addr6;
+		int is_ip = (inet_pton(AF_INET, sni_host, &addr4) == 1 ||
+					inet_pton(AF_INET6, sni_host, &addr6) == 1);
+		if (!is_ip) {
+			SSL_set1_host(ssl, sni_host);
+		} else {
+			debug(LOG_DEBUG, "[TLS] Skipping hostname verification for IP address: %s", sni_host);
+		}
+	}
+}
+
+struct bufferevent *tls_bev_socket_new(struct event_base *base)
+{
+	if (!g_ssl_ctx) {
+		debug(LOG_ERR, "[TLS] SSL context not initialized");
+		return NULL;
+	}
+
+	if (!base) {
+		debug(LOG_ERR, "[TLS] NULL event base");
+		return NULL;
+	}
+
+	SSL *ssl = SSL_new(g_ssl_ctx);
+	if (!ssl) {
+		tls_log_errors("SSL_new");
+		return NULL;
+	}
+
+	tls_configure_ssl(ssl);
+
+	struct bufferevent *ssl_bev = bufferevent_openssl_socket_new(
+		base, -1, ssl,
+		BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS
+	);
+
+	if (!ssl_bev) {
+		tls_log_errors("bufferevent_openssl_socket_new");
+		SSL_free(ssl);
+		return NULL;
+	}
+
+	bufferevent_openssl_set_allow_dirty_shutdown(ssl_bev, 1);
+	debug(LOG_DEBUG, "[TLS] Created TLS socket bufferevent");
+	return ssl_bev;
+}
+
 /**
  * Wrap a raw TCP bufferevent with TLS.
  *
@@ -180,35 +254,7 @@ struct bufferevent *tls_wrap_bev(struct event_base *base, struct bufferevent *be
 		return NULL;
 	}
 
-	/* Set SNI hostname for server certificate verification */
-	struct common_conf *conf = get_common_config();
-	const char *sni_host = conf->tls_server_name ? conf->tls_server_name : conf->server_addr;
-	if (sni_host && !conf->tls_server_name) {
-		/* Only set SNI for hostname (not raw IP) */
-		struct in_addr addr;
-		if (inet_pton(AF_INET, sni_host, &addr) != 1) {
-			/* Not an IP, treat as hostname */
-			SSL_set_tlsext_host_name(ssl, sni_host);
-			debug(LOG_DEBUG, "[TLS] SNI set to: %s", sni_host);
-		}
-	} else if (conf->tls_server_name) {
-		SSL_set_tlsext_host_name(ssl, conf->tls_server_name);
-		debug(LOG_DEBUG, "[TLS] SNI set to: %s", conf->tls_server_name);
-	}
-
-	/* Set hostname for verification (skip for raw IP addresses) */
-	SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-	if (sni_host) {
-		struct in_addr addr4;
-		struct in6_addr addr6;
-		int is_ip = (inet_pton(AF_INET, sni_host, &addr4) == 1 ||
-					inet_pton(AF_INET6, sni_host, &addr6) == 1);
-		if (!is_ip) {
-			SSL_set1_host(ssl, sni_host);
-		} else {
-			debug(LOG_DEBUG, "[TLS] Skipping hostname verification for IP address: %s", sni_host);
-		}
-	}
+	tls_configure_ssl(ssl);
 
 	/* Create SSL-wrapped bufferevent */
 	int sock_err = 0;
