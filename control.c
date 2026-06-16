@@ -1439,7 +1439,7 @@ static void handle_connection_failure(struct common_conf *c_conf, int *retry_tim
 static void handle_connection_success(struct bufferevent *bev) {
 	debug(LOG_INFO, "Successfully connected to xfrp server");
 	struct common_conf *c_conf = get_common_config();
-	debug(LOG_DEBUG, "handle_connection_success: tcp_mux=%d", c_conf->tcp_mux);
+	debug(LOG_ERR, "control connection ready, tcp_mux=%d", c_conf ? c_conf->tcp_mux : -1);
 	
 	// Initialize window and login
 	if (c_conf->tcp_mux) {

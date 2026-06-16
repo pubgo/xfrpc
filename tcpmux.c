@@ -220,16 +220,12 @@ void tcp_mux_encode(enum tcp_mux_type type, enum tcp_mux_flag flags,
  * @brief Gets the TCP multiplexing configuration flag.
  */
 static uint32_t tcp_mux_flag() {
-    static int cached = -1;
-    if (__builtin_expect(cached >= 0, 1))
-        return cached;
     struct common_conf *c_conf = get_common_config();
     if (!c_conf) {
         debug(LOG_ERR, "Failed to get common configuration");
         return 0;
     }
-    cached = c_conf->tcp_mux;
-    return cached;
+    return c_conf->tcp_mux;
 }
 
 /**
@@ -528,7 +524,11 @@ void send_window_update(struct bufferevent *bout, struct tmux_stream *stream, ui
     if (length == 0) {
         enum tcp_mux_flag flags = get_send_flags(stream);
         if (flags != ZERO) {
-            tcp_mux_send_win_update(bout, flags, stream->id, 0);
+            uint32_t delta = 0;
+            if (flags & SYN) {
+                delta = MAX_YAMUX_WINDOW_SIZE;
+            }
+            tcp_mux_send_win_update(bout, flags, stream->id, delta);
         }
         return;
     }
