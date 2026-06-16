@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = if (optimize != .Debug) true else null,
     });
 
     const sources = [_][]const u8{
@@ -56,6 +57,9 @@ pub fn build(b: *std.Build) void {
     const base_flags = [_][]const u8{
         "-D_GNU_SOURCE",
         "-Wall",
+        "-fno-strict-aliasing",
+        "-ffunction-sections",
+        "-fdata-sections",
     };
     const debug_flags = base_flags ++ [_][]const u8{"-DXFRPC_DEBUG"};
     const cflags: []const []const u8 = if (optimize == .Debug) &debug_flags else &base_flags;
@@ -146,6 +150,8 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     if (force_static) exe.linkage = .static;
+    // Collect dead code/data sections produced by -ffunction/-fdata-sections.
+    exe.link_gc_sections = true;
     b.installArtifact(exe);
 
     // `zig build run -- <args>`

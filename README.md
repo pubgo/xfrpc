@@ -151,14 +151,8 @@ file zig-out/bin/xfrpc          # ELF 64-bit ... statically linked, stripped
 
 The resulting `ReleaseSmall` static binary is roughly 3.5 MB (mostly the
 bundled OpenSSL) and runs on any matching Linux kernel without extra libraries.
-
-Optionally compress it further with [UPX](https://upx.github.io/). This roughly
-two-thirds the on-disk size at the cost of a tiny self-extraction step at
-startup (handy for flash-constrained OpenWrt / embedded targets):
-
-```shell
-upx --best --lzma zig-out/bin/xfrpc   # ~3.5 MB -> ~1.15 MB
-```
+Release artifacts are intentionally **not** UPX-compressed to keep runtime RSS
+and page sharing behavior predictable on memory-constrained devices.
 
 On macOS, a portable binary (deps linked statically, only the system libSystem
 left dynamic — no Homebrew needed at runtime) is built with

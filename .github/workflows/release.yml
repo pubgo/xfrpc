@@ -47,10 +47,6 @@ jobs:
                     echo "channel=prod" >> "$GITHUB_OUTPUT"
                   fi
 
-            - name: Install UPX (production only)
-              if: steps.version.outputs.channel == 'prod'
-              run: sudo apt-get update && sudo apt-get install -y upx-ucl
-
             - name: Cache cross-compiled deps sysroot
               uses: actions/cache@v4
               with:
@@ -74,10 +70,6 @@ jobs:
                     -Ddep-prefix="$HOME/.cache/xfrpc-musl/sysroot" \
                     -Doptimize="${optimize}" -Dstatic
                   file zig-out/bin/xfrpc
-
-            - name: Compress with UPX (production only)
-              if: steps.version.outputs.channel == 'prod'
-              run: upx --best --lzma zig-out/bin/xfrpc || true
 
             - name: Package artifact
               run: |
