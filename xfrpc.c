@@ -28,10 +28,12 @@
 #include "tcp_redir.h"
 #include "config.h"
 
+#if XFRPC_WITH_PLUGINS
 #include "plugins/youtubedl.h"
 #include "plugins/telnetd.h"
 #include "plugins/instaloader.h"
 #include "plugins/httpd.h"
+#endif
 
 /**
  * @brief Starts local services based on proxy service configurations
@@ -54,15 +56,31 @@ static void start_xfrpc_local_service(void)
 			continue;
 
 		if (strcmp(ps->plugin, "telnetd") == 0) {
+#if XFRPC_WITH_PLUGINS
 			simple_telnetd_start(ps->local_port);
+#else
+			debug(LOG_ERR, "plugin %s disabled in minimal build", ps->plugin);
+#endif
 		} else if (strcmp(ps->plugin, "instaloader") == 0) {
+#if XFRPC_WITH_PLUGINS
 			start_instaloader_service(ps->local_port);
+#else
+			debug(LOG_ERR, "plugin %s disabled in minimal build", ps->plugin);
+#endif
 		} else if (strcmp(ps->plugin, "youtubedl") == 0) {
+#if XFRPC_WITH_PLUGINS
 			start_youtubedl_service(ps->local_port);
+#else
+			debug(LOG_ERR, "plugin %s disabled in minimal build", ps->plugin);
+#endif
 		} else if (strcmp(ps->plugin, "instaloader_redir") == 0) {
 			start_tcp_redir_service(ps);
 		} else if (strcmp(ps->plugin, "httpd") == 0) {
+#if XFRPC_WITH_PLUGINS
 			start_httpd_service(ps);
+#else
+			debug(LOG_ERR, "plugin %s disabled in minimal build", ps->plugin);
+#endif
 		} else {
 			debug(LOG_ERR, "start_xfrpc_local_service: unknown plugin %s", ps->plugin);
 		}

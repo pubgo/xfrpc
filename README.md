@@ -147,6 +147,11 @@ zig build -Dtarget=x86_64-linux-musl \
           -Ddep-prefix="$HOME/.cache/xfrpc-musl/sysroot" \
           -Doptimize=ReleaseSmall -Dstatic
 file zig-out/bin/xfrpc          # ELF 64-bit ... statically linked, stripped
+
+# smaller build (drops bundled plugins/httpd helpers)
+zig build -Dtarget=x86_64-linux-musl \
+          -Ddep-prefix="$HOME/.cache/xfrpc-musl/sysroot" \
+          -Doptimize=ReleaseSmall -Dstatic -Dminimal=true
 ```
 
 The resulting `ReleaseSmall` static binary is roughly 3.5 MB (mostly the

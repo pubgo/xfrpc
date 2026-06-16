@@ -13,6 +13,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const minimal = b.option(bool, "minimal", "Build minimal binary without bundled plugins") orelse false;
+    const with_plugins = !minimal;
 
     // Optional extra dependency prefix (e.g. a sysroot or custom install root).
     // Adds <prefix>/include and <prefix>/lib to the search paths.
@@ -39,17 +41,21 @@ pub fn build(b: *std.Build) void {
         .strip = if (optimize != .Debug) true else null,
     });
 
-    const sources = [_][]const u8{
+    const core_sources = [_][]const u8{
         // core
         "main.c",        "client.c",    "config.c",   "config_toml.c", "control.c",
         "ini.c",         "msg.c",       "xfrpc.c",    "debug.c",
         "zip.c",         "commandline.c", "crypto.c", "fastpbkdf2.c",
         "utils.c",       "common.c",    "login.c",    "tls.c",
         "third_party/tomlc99/toml.c",
+    };
+    const proxy_sources = [_][]const u8{
         // proxy
-        "proxy_tcp.c",   "proxy_udp.c", "proxy_ftp.c", "proxy.c",
-        "tcpmux.c",      "tcp_redir.c", "mongoose.c",
-        // plugins
+        "proxy_tcp.c", "proxy_udp.c", "proxy_ftp.c", "proxy.c",
+        "tcpmux.c", "tcp_redir.c",
+    };
+    const plugin_sources = [_][]const u8{
+        "mongoose.c",
         "plugins/telnetd.c", "plugins/instaloader.c",
         "plugins/httpd.c",   "plugins/youtubedl.c",
     };
@@ -61,12 +67,23 @@ pub fn build(b: *std.Build) void {
         "-ffunction-sections",
         "-fdata-sections",
     };
-    const debug_flags = base_flags ++ [_][]const u8{"-DXFRPC_DEBUG"};
-    const cflags: []const []const u8 = if (optimize == .Debug) &debug_flags else &base_flags;
+    var source_list: std.ArrayList([]const u8) = .empty;
+    defer source_list.deinit(b.allocator);
+    source_list.appendSlice(b.allocator, &core_sources) catch @panic("OOM");
+    source_list.appendSlice(b.allocator, &proxy_sources) catch @panic("OOM");
+    if (with_plugins) {
+        source_list.appendSlice(b.allocator, &plugin_sources) catch @panic("OOM");
+    }
+
+    var cflags: std.ArrayList([]const u8) = .empty;
+    defer cflags.deinit(b.allocator);
+    cflags.appendSlice(b.allocator, &base_flags) catch @panic("OOM");
+    if (optimize == .Debug) cflags.append(b.allocator, "-DXFRPC_DEBUG") catch @panic("OOM");
+    cflags.append(b.allocator, if (with_plugins) "-DXFRPC_WITH_PLUGINS=1" else "-DXFRPC_WITH_PLUGINS=0") catch @panic("OOM");
 
     mod.addCSourceFiles(.{
-        .files = &sources,
-        .flags = cflags,
+        .files = source_list.items,
+        .flags = cflags.items,
     });
     mod.addIncludePath(b.path("."));
     mod.addIncludePath(b.path("third_party/tomlc99"));

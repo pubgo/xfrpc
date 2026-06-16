@@ -64,11 +64,15 @@ jobs:
                   else
                     optimize="ReleaseSafe"
                   fi
+                  minimal=""
+                  if [[ "${{ matrix.label }}" == "linux_armv7" ]]; then
+                    minimal="-Dminimal=true"
+                  fi
                   echo "Channel: ${channel}, Optimize: ${optimize}, Target: ${{ matrix.zig_target }}"
                   zig build \
                     -Dtarget=${{ matrix.zig_target }} \
                     -Ddep-prefix="$HOME/.cache/xfrpc-musl/sysroot" \
-                    -Doptimize="${optimize}" -Dstatic
+                    -Doptimize="${optimize}" -Dstatic $minimal
                   file zig-out/bin/xfrpc
 
             - name: Package artifact
