@@ -101,10 +101,9 @@ struct start_work_conn_resp {
 int new_udp_packet_marshal(const struct udp_packet *udp, char **msg);
 int new_proxy_service_marshal(const struct proxy_service *np_req, char **msg);
 int new_work_conn_marshal(const struct work_conn *work_c, char **msg);
+int ping_request_marshal(char **msg);
 size_t login_request_marshal(char **msg);
 
-// Authentication helper
-char *get_auth_key(const char *token, time_t *timestamp);
 
 // Unmarshalling functions (Parse JSON to structures)
 struct new_proxy_response *new_proxy_resp_unmarshal(const char *jres);

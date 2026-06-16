@@ -219,6 +219,87 @@ char *get_auth_key(const char *token, time_t *timestamp)
 	return auth_key;
 }
 
+int common_conf_uses_jwt_auth(const struct common_conf *cf)
+{
+	if (!cf) {
+		return 0;
+	}
+	if (cf->auth_method && strcmp(cf->auth_method, "jwt") == 0) {
+		return 1;
+	}
+	if (cf->auth_token && strncmp(cf->auth_token, "eyJ", 3) == 0) {
+		return 1;
+	}
+	return 0;
+}
+
+int common_conf_auth_scope_heartbeats(const struct common_conf *cf)
+{
+	if (!cf) {
+		return 0;
+	}
+	if (cf->auth_scope_heartbeats) {
+		return 1;
+	}
+	return common_conf_uses_jwt_auth(cf);
+}
+
+int common_conf_auth_scope_new_work_conns(const struct common_conf *cf)
+{
+	if (!cf) {
+		return 0;
+	}
+	if (cf->auth_scope_new_work_conns) {
+		return 1;
+	}
+	return common_conf_uses_jwt_auth(cf);
+}
+
+static void json_add_privilege_key(struct json_object *jobj, const struct common_conf *cf)
+{
+	if (!cf || !cf->auth_token || !*cf->auth_token) {
+		return;
+	}
+	JSON_MARSHAL_TYPE(jobj, "privilege_key", string, cf->auth_token);
+}
+
+/**
+ * @brief Marshals a heartbeat ping message for the FRP server
+ */
+int ping_request_marshal(char **msg)
+{
+	if (!msg) {
+		return 0;
+	}
+
+	struct common_conf *cf = get_common_config();
+	struct json_object *j_ping = json_object_new_object();
+	if (!j_ping) {
+		return 0;
+	}
+
+	if (common_conf_auth_scope_heartbeats(cf)) {
+		json_add_privilege_key(j_ping, cf);
+		if (sizeof(time_t) == 4) {
+			JSON_MARSHAL_TYPE(j_ping, "timestamp", int, (int)time(NULL));
+		} else {
+			JSON_MARSHAL_TYPE(j_ping, "timestamp", int64, (int64_t)time(NULL));
+		}
+	}
+
+	const char *json_str = json_object_to_json_string(j_ping);
+	int nret = 0;
+	if (json_str && strlen(json_str) > 0) {
+		*msg = strdup(json_str);
+		if (*msg) {
+			nret = (int)strlen(json_str);
+		}
+	}
+
+	json_object_put(j_ping);
+	return nret;
+}
+
 /**
  * @brief Marshals login request data into a JSON string
  *
@@ -240,9 +321,19 @@ size_t login_request_marshal(char **msg)
 		return 0;
 	}
 
-	// Generate new auth key
+	// Generate auth key / JWT privilege key
 	struct common_conf *cf = get_common_config();
-	char *auth_key = get_auth_key(cf->auth_token, &lg->timestamp);
+	char *auth_key = NULL;
+	if (common_conf_uses_jwt_auth(cf)) {
+		if (!cf->auth_token || !*cf->auth_token) {
+			json_object_put(j_login_req);
+			return 0;
+		}
+		lg->timestamp = time(NULL);
+		auth_key = strdup(cf->auth_token);
+	} else {
+		auth_key = get_auth_key(cf->auth_token, &lg->timestamp);
+	}
 	if (!auth_key) {
 		json_object_put(j_login_req);
 		return 0;
@@ -259,7 +350,9 @@ size_t login_request_marshal(char **msg)
 
 	// Add required fields
 	JSON_MARSHAL_TYPE(j_login_req, "version", string, lg->version);
-	JSON_MARSHAL_TYPE(j_login_req, "hostname", string, SAFE_JSON_STRING(lg->hostname));
+	if (lg->hostname && *lg->hostname) {
+		JSON_MARSHAL_TYPE(j_login_req, "hostname", string, lg->hostname);
+	}
 	JSON_MARSHAL_TYPE(j_login_req, "os", string, lg->os);
 	JSON_MARSHAL_TYPE(j_login_req, "arch", string, lg->arch);
 	JSON_MARSHAL_TYPE(j_login_req, "privilege_key", string, lg->privilege_key);
@@ -276,13 +369,16 @@ size_t login_request_marshal(char **msg)
 	if (lg->user) {
 		JSON_MARSHAL_TYPE(j_login_req, "user", string, lg->user);
 	}
-	if (lg->run_id) {
+	if (!is_logged() && lg->run_id && *lg->run_id) {
+		/* first login: omit run_id like official frpc (omitempty) */
+	} else if (lg->run_id && *lg->run_id) {
 		JSON_MARSHAL_TYPE(j_login_req, "run_id", string, lg->run_id);
 	}
 
 	// Convert to string
 	size_t nret = 0;
-	const char *json_str = json_object_to_json_string(j_login_req);
+	const char *json_str = json_object_to_json_string_ext(j_login_req,
+		JSON_C_TO_STRING_PLAIN);
 	if (json_str && strlen(json_str) > 0) {
 		*msg = strdup(json_str);
 		if (*msg) {
@@ -396,6 +492,45 @@ int new_proxy_service_marshal(const struct proxy_service *np_req, char **msg)
 	JSON_MARSHAL_TYPE(j_np_req, "http_user", string, SAFE_JSON_STRING(np_req->http_user));
 	JSON_MARSHAL_TYPE(j_np_req, "http_pwd", string, SAFE_JSON_STRING(np_req->http_pwd));
 
+	if ((np_req->request_headers && *np_req->request_headers) ||
+		(np_req->http_referer && *np_req->http_referer) ||
+		(np_req->http_origin && *np_req->http_origin)) {
+		struct json_object *headers = json_object_new_object();
+		if (headers) {
+			if (np_req->request_headers && *np_req->request_headers) {
+				char *headers_copy = strdup(np_req->request_headers);
+				if (headers_copy) {
+					char *save_line = NULL;
+					char *line = strtok_r(headers_copy, "\n", &save_line);
+					while (line) {
+						char *sep = strchr(line, '\t');
+						if (sep) {
+							*sep = '\0';
+							char *header_key = line;
+							char *header_value = sep + 1;
+							if (*header_key && *header_value) {
+								json_object_object_add(headers, header_key,
+									json_object_new_string(header_value));
+							}
+						}
+						line = strtok_r(NULL, "\n", &save_line);
+					}
+					free(headers_copy);
+				}
+			}
+			if (np_req->http_referer && *np_req->http_referer) {
+				json_object_object_add(headers, "Referer",
+					json_object_new_string(np_req->http_referer));
+			}
+			if (np_req->http_origin && *np_req->http_origin) {
+				json_object_object_add(headers, "Origin",
+					json_object_new_string(np_req->http_origin));
+			}
+			/* frp NewProxy uses "headers", not "request_headers" (see pkg/msg/msg.go) */
+			json_object_object_add(j_np_req, "headers", headers);
+		}
+	}
+
 	// Add TCPMux specific fields
 	if (strcmp(proxy_type, "tcpmux") == 0) {
 		JSON_MARSHAL_TYPE(j_np_req, "multiplexer", string,
@@ -473,6 +608,16 @@ int new_work_conn_marshal(const struct work_conn *work_c, char **msg)
 	// Add run_id field
 	JSON_MARSHAL_TYPE(j_new_work_conn, "run_id", string, SAFE_JSON_STRING(work_c->run_id));
 
+	struct common_conf *cf = get_common_config();
+	if (common_conf_auth_scope_new_work_conns(cf)) {
+		json_add_privilege_key(j_new_work_conn, cf);
+		if (sizeof(time_t) == 4) {
+			JSON_MARSHAL_TYPE(j_new_work_conn, "timestamp", int, (int)time(NULL));
+		} else {
+			JSON_MARSHAL_TYPE(j_new_work_conn, "timestamp", int64, (int64_t)time(NULL));
+		}
+	}
+
 	// Convert to JSON string
 	const char *json_str = json_object_to_json_string(j_new_work_conn);
 	int nret = 0;
@@ -523,18 +668,15 @@ struct new_proxy_response *new_proxy_resp_unmarshal(const char *jres)
 		}
 	}
 
-	// Get required remote_addr field
+	// Optional remote_addr (http subdomain proxies may omit it)
 	struct json_object *j_remote_addr = NULL;
-	if (!json_object_object_get_ex(j_np_res, "remote_addr", &j_remote_addr)) {
-		goto error;
-	}
-	
-	// Parse port from remote_addr
-	const char *remote_addr = json_object_get_string(j_remote_addr);
-	if (remote_addr) {
-		const char *port = strrchr(remote_addr, ':');
-		if (port) {
-			npr->remote_port = atoi(port + 1);
+	if (json_object_object_get_ex(j_np_res, "remote_addr", &j_remote_addr)) {
+		const char *remote_addr = json_object_get_string(j_remote_addr);
+		if (remote_addr) {
+			const char *port = strrchr(remote_addr, ':');
+			if (port) {
+				npr->remote_port = atoi(port + 1);
+			}
 		}
 	}
 

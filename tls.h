@@ -20,6 +20,15 @@
 int tls_init(void);
 
 /**
+ * Create a new TCP bufferevent that performs TLS during connect.
+ * Use bufferevent_socket_connect / bufferevent_socket_connect_hostname on the result.
+ *
+ * @param base  Event base for the new bufferevent
+ * @return      TLS bufferevent, or NULL on error
+ */
+struct bufferevent *tls_bev_socket_new(struct event_base *base);
+
+/**
  * Wrap an existing TCP bufferevent with TLS.
  * The original bev is consumed; returns a new SSL-wrapped bev on success,
  * or NULL on failure (original bev is freed on failure).

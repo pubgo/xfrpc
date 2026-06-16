@@ -12,21 +12,21 @@ xfrpc partially compitable with latest frp release feature, It targets to fully 
 
 the following table is detail  compatible feature:
 
-| Feature  | xfrpc | frpc |
-| ------------- | ------------- | ---------|
-| tcp  | Yes |	 Yes  |
-| tcpmux  | Yes |	 Yes  |
-| http  | Yes |	 Yes  |
-| https  | Yes |  Yes  |
-| custom_domains | Yes | Yes |
-| subdomain | Yes | Yes |
-| socks5 | Yes | No |
-| use_encryption | No | Yes |
-| use_compression | No | Yes |
-| udp  | No |  Yes  |
-| p2p  | No |  Yes  |
-| xtcp  | No |  Yes  |
-| stcp  | No |  Yes  |
+| Feature         | xfrpc | frpc |
+| --------------- | ----- | ---- |
+| tcp             | Yes   | Yes  |
+| tcpmux          | Yes   | Yes  |
+| http            | Yes   | Yes  |
+| https           | Yes   | Yes  |
+| custom_domains  | Yes   | Yes  |
+| subdomain       | Yes   | Yes  |
+| socks5          | Yes   | No   |
+| use_encryption  | No    | Yes  |
+| use_compression | No    | Yes  |
+| udp             | No    | Yes  |
+| p2p             | No    | Yes  |
+| xtcp            | No    | Yes  |
+| stcp            | No    | Yes  |
 
 
 
@@ -112,6 +112,86 @@ cmake ..
 make
 ```
 This will compile xfrpc and create an executable in the build directory. You can then run xfrpc using the executable by running the appropriate command in terminal.
+
+### Build with Zig (macOS / Linux, optional fully-static binary)
+
+[`build.zig`](build.zig) provides an alternative to CMake that works on macOS
+and Linux and can cross-compile a **fully static** Linux binary (zero runtime
+dependencies, ideal for OpenWrt / containers). Requires [Zig](https://ziglang.org/) >= 0.16.
+
+Native build (uses the system / Homebrew copies of OpenSSL, libevent, json-c, zlib):
+
+```shell
+zig build                       # debug build -> zig-out/bin/xfrpc
+zig build -Doptimize=ReleaseSmall
+./zig-out/bin/xfrpc -v
+```
+
+On macOS the script auto-detects Homebrew prefixes (`openssl@3`, `libevent`,
+`json-c`, `zlib`). If your dependencies live elsewhere, point to them with
+`-Ddep-prefix=<install-root>`.
+
+Fully static Linux binary via cross-compilation. First build the dependencies
+as musl static libraries (downloads + builds zlib, OpenSSL, libevent, json-c
+into a sysroot under `~/.cache/xfrpc-musl`):
+
+```shell
+scripts/build-musl-deps.sh                       # x86_64-linux-musl
+# TARGET=aarch64-linux-musl scripts/build-musl-deps.sh   # other arches
+```
+
+Then link xfrpc against that sysroot:
+
+```shell
+zig build -Dtarget=x86_64-linux-musl \
+          -Ddep-prefix="$HOME/.cache/xfrpc-musl/sysroot" \
+          -Doptimize=ReleaseSmall -Dstatic
+file zig-out/bin/xfrpc          # ELF 64-bit ... statically linked, stripped
+
+# smaller build (drops bundled plugins/httpd helpers)
+zig build -Dtarget=x86_64-linux-musl \
+          -Ddep-prefix="$HOME/.cache/xfrpc-musl/sysroot" \
+          -Doptimize=ReleaseSmall -Dstatic -Dminimal=true
+```
+
+The resulting `ReleaseSmall` static binary is roughly 3.5 MB (mostly the
+bundled OpenSSL) and runs on any matching Linux kernel without extra libraries.
+Release artifacts are intentionally **not** UPX-compressed to keep runtime RSS
+and page sharing behavior predictable on memory-constrained devices.
+
+On macOS, a portable binary (deps linked statically, only the system libSystem
+left dynamic — no Homebrew needed at runtime) is built with
+[`scripts/build-macos-deps.sh`](scripts/build-macos-deps.sh) and `-Ddep-static`:
+
+```shell
+ARCH=arm64 scripts/build-macos-deps.sh        # or ARCH=x86_64
+zig build -Ddep-prefix="$HOME/.cache/xfrpc-macos/arm64/sysroot" \
+          -Doptimize=ReleaseSmall -Ddep-static
+otool -L zig-out/bin/xfrpc                     # -> only system libSystem / libz
+```
+
+To cross-compile the other architecture (e.g. an `x86_64` binary on an Apple
+Silicon machine), add `-Dtarget=` and export `SDKROOT` so the SDK headers
+resolve:
+
+```shell
+ARCH=x86_64 scripts/build-macos-deps.sh
+export SDKROOT="$(xcrun --show-sdk-path)"
+zig build -Dtarget=x86_64-macos \
+          -Ddep-prefix="$HOME/.cache/xfrpc-macos/x86_64/sysroot" \
+          -Doptimize=ReleaseSmall -Ddep-static
+```
+
+
+Pushing a `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which builds static binaries for `linux_amd64`, `linux_arm64`, `linux_armv7`
+(UPX-compressed on stable tags) plus portable `darwin_amd64` / `darwin_arm64`,
+and publishes them as a GitHub Release. Tags containing `-alpha` / `-beta` are
+published as pre-releases.
+
+```shell
+git tag v5.06.916 && git push origin v5.06.916
+```
 
 ### Build static binary in Alpine container
 

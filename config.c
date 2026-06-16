@@ -12,8 +12,10 @@
 #include <ctype.h>
 #include <sys/types.h>
 #include <pwd.h>
+#ifdef __linux__
 #include <shadow.h>
 #include <crypt.h>
+#endif
 
 #include "ini.h"
 #include "uthash.h"
@@ -47,8 +49,9 @@ static const char *valid_types[] = {
 static struct common_conf    *c_conf;    /* Common configuration settings */
 static struct proxy_service *all_ps;     /* Hash table of all proxy services */
 
-/* Forward declaration */
+/* Forward declarations */
 static void new_ftp_data_proxy_service(struct proxy_service *ftp_ps);
+void load_toml_config(const char *confile);
 
 /**
  * @brief Gets the common configuration settings
@@ -72,6 +75,8 @@ void free_common_config(void)
 	if (!c_conf)
 		return;
 	SAFE_FREE(c_conf->server_addr);
+	SAFE_FREE(c_conf->user);
+	SAFE_FREE(c_conf->auth_method);
 	SAFE_FREE(c_conf->auth_token);
 	SAFE_FREE(c_conf->tls_cert_file);
 	SAFE_FREE(c_conf->tls_key_file);
@@ -132,10 +137,12 @@ static void dump_common_conf(void)
 		return;
 	}
 
-	debug(LOG_DEBUG, "Section[common]: {server_addr:%s, server_port:%d, auth_token:%s, interval:%d, timeout:%d, tls:%d}",
-		c_conf->server_addr, 
-		c_conf->server_port, 
-		c_conf->auth_token, 
+	debug(LOG_DEBUG, "Section[common]: {server_addr:%s, server_port:%d, user:%s, auth_method:%s, auth_token:%s, interval:%d, timeout:%d, tls:%d}",
+		c_conf->server_addr,
+		c_conf->server_port,
+		c_conf->user ? c_conf->user : "(none)",
+		c_conf->auth_method ? c_conf->auth_method : "(token)",
+		c_conf->auth_token,
 		c_conf->heartbeat_interval, 
 		c_conf->heartbeat_timeout,
 		c_conf->tls_enable);
@@ -299,6 +306,9 @@ static struct proxy_service *new_proxy_service(const char *name)
 	ps->subdomain = NULL;
 	ps->locations = NULL;
 	ps->host_header_rewrite = NULL;
+	ps->http_referer = NULL;
+	ps->http_origin = NULL;
+	ps->request_headers = NULL;
 	ps->http_user = NULL;
 	ps->http_pwd = NULL;
 
@@ -623,23 +633,80 @@ static enum xdpi_service_type convert_service_type(const char *value)
  * - Plugin configurations
  * - Group settings
  */
-static int proxy_service_handler(void *user, const char *sect, const char *nm, const char *value)
+int config_set_common_field(struct common_conf *config, const char *name, const char *value)
 {
-	// Skip common section
-	if (strcmp(sect, "common") == 0) {
+	if (!config || !name || !value) {
 		return 0;
 	}
 
-	// Find or create proxy service
-	struct proxy_service *ps = NULL;
-	HASH_FIND_STR(all_ps, sect, ps);
-	if (!ps) {
-		ps = new_proxy_service(sect);
-		if (!ps) {
-			debug(LOG_ERR, "Failed to create proxy service");
-			exit(0);
-		}
-		HASH_ADD_KEYPTR(hh, all_ps, ps->proxy_name, strlen(ps->proxy_name), ps);
+	if (strcmp(name, "server_addr") == 0) {
+		SAFE_FREE(config->server_addr);
+		config->server_addr = strdup(value);
+		assert(config->server_addr);
+	}
+	else if (strcmp(name, "server_port") == 0) {
+		config->server_port = atoi(value);
+	}
+	else if (strcmp(name, "user") == 0) {
+		SAFE_FREE(config->user);
+		config->user = strdup(value);
+		assert(config->user);
+	}
+	else if (strcmp(name, "auth_method") == 0) {
+		SAFE_FREE(config->auth_method);
+		config->auth_method = strdup(value);
+		assert(config->auth_method);
+	}
+	else if (strcmp(name, "auth_token") == 0 || strcmp(name, "token") == 0) {
+		SAFE_FREE(config->auth_token);
+		config->auth_token = strdup(value);
+		assert(config->auth_token);
+	}
+	else if (strcmp(name, "auth_scope_heartbeats") == 0) {
+		config->auth_scope_heartbeats = !!atoi(value);
+	}
+	else if (strcmp(name, "auth_scope_new_work_conns") == 0) {
+		config->auth_scope_new_work_conns = !!atoi(value);
+	}
+	else if (strcmp(name, "heartbeat_interval") == 0) {
+		config->heartbeat_interval = atoi(value);
+	}
+	else if (strcmp(name, "heartbeat_timeout") == 0) {
+		config->heartbeat_timeout = atoi(value);
+	}
+	else if (strcmp(name, "tcp_mux") == 0) {
+		config->tcp_mux = !!atoi(value);
+	}
+	else if (strcmp(name, "tls_enable") == 0) {
+		config->tls_enable = !!atoi(value);
+	}
+	else if (strcmp(name, "tls_cert_file") == 0) {
+		SAFE_FREE(config->tls_cert_file);
+		config->tls_cert_file = strdup(value);
+	}
+	else if (strcmp(name, "tls_key_file") == 0) {
+		SAFE_FREE(config->tls_key_file);
+		config->tls_key_file = strdup(value);
+	}
+	else if (strcmp(name, "tls_trusted_ca_file") == 0) {
+		SAFE_FREE(config->tls_trusted_ca_file);
+		config->tls_trusted_ca_file = strdup(value);
+	}
+	else if (strcmp(name, "tls_server_name") == 0) {
+		SAFE_FREE(config->tls_server_name);
+		config->tls_server_name = strdup(value);
+	}
+	else {
+		return 0;
+	}
+
+	return 1;
+}
+
+int config_set_proxy_field(struct proxy_service *ps, const char *nm, const char *value)
+{
+	if (!ps || !nm || !value) {
+		return 0;
 	}
 
 	#define MATCH_NAME(s) strcmp(nm, s) == 0
@@ -648,7 +715,6 @@ static int proxy_service_handler(void *user, const char *sect, const char *nm, c
 		assert(ps->field); \
 	} while(0)
 
-	// Process configuration parameters
 	if (MATCH_NAME("type")) {
 		if (!get_valid_type(value)) {
 			debug(LOG_ERR, "Unsupported proxy type: %s", value);
@@ -665,6 +731,9 @@ static int proxy_service_handler(void *user, const char *sect, const char *nm, c
 	else if (MATCH_NAME("use_compression")) ps->use_compression = is_true(value);
 	else if (MATCH_NAME("http_user")) SET_STRING_VALUE(http_user);
 	else if (MATCH_NAME("http_pwd")) SET_STRING_VALUE(http_pwd);
+	else if (MATCH_NAME("http_referer")) SET_STRING_VALUE(http_referer);
+	else if (MATCH_NAME("http_origin")) SET_STRING_VALUE(http_origin);
+	else if (MATCH_NAME("request_headers")) SET_STRING_VALUE(request_headers);
 	else if (MATCH_NAME("subdomain")) SET_STRING_VALUE(subdomain);
 	else if (MATCH_NAME("custom_domains")) SET_STRING_VALUE(custom_domains);
 	else if (MATCH_NAME("locations")) SET_STRING_VALUE(locations);
@@ -697,11 +766,10 @@ static int proxy_service_handler(void *user, const char *sect, const char *nm, c
 		ps->end_time = hour;
 	}
 	else {
-		debug(LOG_ERR, "Unknown option %s in section %s", nm, sect);
+		debug(LOG_DEBUG, "Ignoring unknown proxy option %s", nm);
 		return 0;
 	}
 
-	// Special handling for socks5 and plugin configurations
 	if (ps->proxy_type) {
 		if (strcmp(ps->proxy_type, "socks5") == 0) {
 			if (ps->remote_port == 0) ps->remote_port = DEFAULT_SOCKS5_PORT;
@@ -710,6 +778,41 @@ static int proxy_service_handler(void *user, const char *sect, const char *nm, c
 		else if (strcmp(ps->proxy_type, "tcp") == 0) {
 			process_plugin_conf(ps);
 		}
+	}
+
+	return 1;
+}
+
+struct proxy_service *config_create_proxy(const char *name)
+{
+	struct proxy_service *ps = new_proxy_service(name);
+	if (!ps) {
+		return NULL;
+	}
+	HASH_ADD_KEYPTR(hh, all_ps, ps->proxy_name, strlen(ps->proxy_name), ps);
+	return ps;
+}
+
+static int proxy_service_handler(void *user, const char *sect, const char *nm, const char *value)
+{
+	(void)user;
+	if (strcmp(sect, "common") == 0) {
+		return 0;
+	}
+
+	struct proxy_service *ps = NULL;
+	HASH_FIND_STR(all_ps, sect, ps);
+	if (!ps) {
+		ps = config_create_proxy(sect);
+		if (!ps) {
+			debug(LOG_ERR, "Failed to create proxy service");
+			exit(0);
+		}
+	}
+
+	if (!config_set_proxy_field(ps, nm, value)) {
+		debug(LOG_ERR, "Unknown option %s in section %s", nm, sect);
+		return 0;
 	}
 
 	return 1;
@@ -737,52 +840,14 @@ static int proxy_service_handler(void *user, const char *sect, const char *nm, c
 static int common_handler(void *user, const char *section, const char *name, const char *value)
 {
 	struct common_conf *config = (struct common_conf *)user;
-	
-	#define MATCH(s, n) strcmp(section, s) == 0 && strcmp(name, n) == 0
-	
-	if (MATCH("common", "server_addr")) {
-		SAFE_FREE(config->server_addr);
-		config->server_addr = strdup(value);
-		assert(config->server_addr);
-	} 
-	else if (MATCH("common", "server_port")) {
-		config->server_port = atoi(value);
+
+	if (strcmp(section, "common") != 0) {
+		return 0;
 	}
-	else if (MATCH("common", "heartbeat_interval")) {
-		config->heartbeat_interval = atoi(value);
+
+	if (!config_set_common_field(config, name, value)) {
+		debug(LOG_DEBUG, "Ignoring unknown common option %s", name);
 	}
-	else if (MATCH("common", "heartbeat_timeout")) {
-		config->heartbeat_timeout = atoi(value);
-	}
-	else if (MATCH("common", "token")) {
-		SAFE_FREE(config->auth_token);
-		config->auth_token = strdup(value);
-		assert(config->auth_token);
-	}
-	else if (MATCH("common", "tcp_mux")) {
-		config->tcp_mux = !!atoi(value); // Convert to boolean
-	}
-	/* TLS settings */
-	else if (MATCH("common", "tls_enable")) {
-		config->tls_enable = !!atoi(value);
-	}
-	else if (MATCH("common", "tls_cert_file")) {
-		SAFE_FREE(config->tls_cert_file);
-		config->tls_cert_file = strdup(value);
-	}
-	else if (MATCH("common", "tls_key_file")) {
-		SAFE_FREE(config->tls_key_file);
-		config->tls_key_file = strdup(value);
-	}
-	else if (MATCH("common", "tls_trusted_ca_file")) {
-		SAFE_FREE(config->tls_trusted_ca_file);
-		config->tls_trusted_ca_file = strdup(value);
-	}
-	else if (MATCH("common", "tls_server_name")) {
-		SAFE_FREE(config->tls_server_name);
-		config->tls_server_name = strdup(value);
-	}
-	
 	return 1;
 }
 
@@ -888,6 +953,14 @@ void load_config(const char *confile) {
 
 	debug(LOG_DEBUG, "Reading configuration file '%s'", confile);
 
+	if (config_is_toml_path(confile)) {
+		load_toml_config(confile);
+		dump_common_conf();
+		validate_heartbeat_config();
+		dump_all_ps();
+		return;
+	}
+
 	// Parse common section
 	if (ini_parse(confile, common_handler, c_conf) < 0) {
 		debug(LOG_ERR, "Config file parse failed");
@@ -961,6 +1034,9 @@ void free_proxy_service(struct proxy_service *ps)
 	SAFE_FREE(ps->subdomain);
 	SAFE_FREE(ps->locations);
 	SAFE_FREE(ps->host_header_rewrite);
+	SAFE_FREE(ps->http_referer);
+	SAFE_FREE(ps->http_origin);
+	SAFE_FREE(ps->request_headers);
 	SAFE_FREE(ps->http_user);
 	SAFE_FREE(ps->http_pwd);
 	SAFE_FREE(ps->group);

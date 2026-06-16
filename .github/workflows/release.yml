@@ -1,0 +1,219 @@
+name: Release
+
+on:
+    push:
+        tags:
+            - "v*"
+
+permissions:
+    contents: write
+
+jobs:
+    # Build one fully-static musl binary per architecture. Each target gets its
+    # own sysroot of cross-compiled C deps (OpenSSL/libevent/json-c/zlib) built by
+    # scripts/build-musl-deps.sh, then linked via `zig build -Dstatic`.
+    build:
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - zig_target: x86_64-linux-musl
+                      label: linux_amd64
+                    - zig_target: aarch64-linux-musl
+                      label: linux_arm64
+                    - zig_target: arm-linux-musleabihf
+                      label: linux_armv7
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Install Zig
+              uses: mlugg/setup-zig@v2
+              with:
+                  version: 0.16.0
+
+            - name: Parse version and channel from tag
+              id: version
+              run: |
+                  version="${GITHUB_REF#refs/tags/}"
+                  echo "version=${version}" >> "$GITHUB_OUTPUT"
+                  if [[ "$version" =~ -alpha ]]; then
+                    echo "channel=dev" >> "$GITHUB_OUTPUT"
+                  elif [[ "$version" =~ -beta ]]; then
+                    echo "channel=beta" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "channel=prod" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Cache cross-compiled deps sysroot
+              uses: actions/cache@v4
+              with:
+                  path: ~/.cache/xfrpc-musl
+                  key: musl-deps-${{ matrix.zig_target }}-${{ hashFiles('scripts/build-musl-deps.sh') }}
+
+            - name: Cross-compile C dependencies (musl static)
+              run: TARGET=${{ matrix.zig_target }} scripts/build-musl-deps.sh
+
+            - name: Build static xfrpc
+              run: |
+                  channel="${{ steps.version.outputs.channel }}"
+                  if [[ "$channel" == "prod" ]]; then
+                    optimize="ReleaseSmall"
+                  else
+                    optimize="ReleaseSafe"
+                  fi
+                  minimal=""
+                  if [[ "${{ matrix.label }}" == "linux_armv7" ]]; then
+                    minimal="-Dminimal=true"
+                  fi
+                  echo "Channel: ${channel}, Optimize: ${optimize}, Target: ${{ matrix.zig_target }}"
+                  zig build \
+                    -Dtarget=${{ matrix.zig_target }} \
+                    -Ddep-prefix="$HOME/.cache/xfrpc-musl/sysroot" \
+                    -Doptimize="${optimize}" -Dstatic $minimal
+                  file zig-out/bin/xfrpc
+
+            - name: Package artifact
+              run: |
+                  mkdir -p release-artifacts
+                  archive="xfrpc_${{ steps.version.outputs.version }}_${{ matrix.label }}.tar.gz"
+                  tar -czf "release-artifacts/${archive}" -C zig-out/bin xfrpc
+                  ls -l "release-artifacts/${archive}"
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: xfrpc-${{ matrix.label }}
+                  path: release-artifacts/*.tar.gz
+
+    # Build a portable macOS binary per arch. GitHub's Intel macOS runners
+    # (macos-13) are deprecated, so both arches are built on the arm64 runner
+    # (macos-14) and the x86_64 binary is cross-compiled. Setting SDKROOT lets
+    # the cross build find the system SDK headers (e.g. <arpa/telnet.h>). The C
+    # deps are linked statically via -Ddep-static; only system libraries
+    # (libSystem/libz) stay dynamic, so the binary runs without Homebrew.
+    build-macos:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: x86_64
+                      zig_target: x86_64-macos
+                      label: darwin_amd64
+                    - arch: arm64
+                      zig_target: aarch64-macos
+                      label: darwin_arm64
+        runs-on: macos-14
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Install Zig
+              uses: mlugg/setup-zig@v2
+              with:
+                  version: 0.16.0
+
+            - name: Parse version and channel from tag
+              id: version
+              run: |
+                  version="${GITHUB_REF#refs/tags/}"
+                  echo "version=${version}" >> "$GITHUB_OUTPUT"
+                  if [[ "$version" =~ -alpha ]]; then
+                    echo "channel=dev" >> "$GITHUB_OUTPUT"
+                  elif [[ "$version" =~ -beta ]]; then
+                    echo "channel=beta" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "channel=prod" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Cache macOS deps sysroot
+              uses: actions/cache@v4
+              with:
+                  path: ~/.cache/xfrpc-macos
+                  key: macos-deps-${{ matrix.arch }}-${{ hashFiles('scripts/build-macos-deps.sh') }}
+
+            - name: Build C dependencies (macOS static)
+              run: ARCH=${{ matrix.arch }} scripts/build-macos-deps.sh
+
+            - name: Build portable xfrpc
+              run: |
+                  channel="${{ steps.version.outputs.channel }}"
+                  if [[ "$channel" == "prod" ]]; then
+                    optimize="ReleaseSmall"
+                  else
+                    optimize="ReleaseSafe"
+                  fi
+                  # SDKROOT lets the cross build resolve the macOS SDK headers.
+                  export SDKROOT="$(xcrun --show-sdk-path)"
+                  echo "Channel: ${channel}, Optimize: ${optimize}, Target: ${{ matrix.zig_target }}, SDKROOT: ${SDKROOT}"
+                  zig build \
+                    -Dtarget=${{ matrix.zig_target }} \
+                    -Ddep-prefix="$HOME/.cache/xfrpc-macos/${{ matrix.arch }}/sysroot" \
+                    -Doptimize="${optimize}" -Ddep-static
+                  file zig-out/bin/xfrpc
+                  otool -L zig-out/bin/xfrpc
+                  # The x86_64 binary cannot run on the arm64 runner.
+                  if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+                    ./zig-out/bin/xfrpc -v
+                  fi
+
+            - name: Package artifact
+              run: |
+                  mkdir -p release-artifacts
+                  archive="xfrpc_${{ steps.version.outputs.version }}_${{ matrix.label }}.tar.gz"
+                  tar -czf "release-artifacts/${archive}" -C zig-out/bin xfrpc
+                  ls -l "release-artifacts/${archive}"
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: xfrpc-${{ matrix.label }}
+                  path: release-artifacts/*.tar.gz
+
+    release:
+        needs: [build, build-macos]
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Parse version and channel from tag
+              id: version
+              run: |
+                  version="${GITHUB_REF#refs/tags/}"
+                  echo "version=${version}" >> "$GITHUB_OUTPUT"
+                  if [[ "$version" =~ -alpha|-beta ]]; then
+                    echo "channel=pre" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "channel=prod" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: artifacts
+                  merge-multiple: true
+
+            - name: Generate checksums
+              run: |
+                  cd artifacts
+                  sha256sum *.tar.gz > checksums.txt
+                  cat checksums.txt
+
+            - name: Create GitHub Release
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  prerelease=""
+                  if [[ "${{ steps.version.outputs.channel }}" != "prod" ]]; then
+                    prerelease="--prerelease"
+                  fi
+                  gh release create "${{ github.ref_name }}" \
+                    --title "xfrpc ${{ steps.version.outputs.version }}" \
+                    --generate-notes \
+                    $prerelease \
+                    artifacts/*

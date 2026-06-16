@@ -36,6 +36,7 @@
 static struct control *main_ctl;
 static bool xfrpc_status;
 static int is_login;
+static int login_pending;
 static time_t pong_time;
 
 static void new_work_connection(struct bufferevent *bev, struct tmux_stream *stream);
@@ -373,20 +374,29 @@ static void start_proxy_services()
  */
 static void ping(void)
 {
+	char *ping_msg = NULL;
+	int msg_len = 0;
+
 	// Validate bufferevent
 	if (!main_ctl || !main_ctl->connect_bev) {
 		debug(LOG_ERR, "Invalid bufferevent for ping"); 
 		return;
 	}
 
-	// Send empty ping message
-	const char *ping_msg = "{}";
-	send_enc_msg_frp_server(main_ctl->connect_bev, 
-						   TypePing, 
-						   ping_msg, 
-						   strlen(ping_msg), 
-						   &main_ctl->stream);
+	msg_len = ping_request_marshal(&ping_msg);
+	if (msg_len <= 0 || !ping_msg) {
+		debug(LOG_ERR, "Failed to marshal ping request");
+		SAFE_FREE(ping_msg);
+		return;
+	}
 
+	send_enc_msg_frp_server(main_ctl->connect_bev,
+						TypePing,
+						ping_msg,
+						(size_t)msg_len,
+						&main_ctl->stream);
+
+	SAFE_FREE(ping_msg);
 	debug(LOG_DEBUG, "Sent ping message");
 }
 
@@ -484,8 +494,18 @@ struct bufferevent *connect_server(struct event_base *base, const char *name, co
 		return NULL;
 	}
 
-	// Create new bufferevent socket
-	struct bufferevent *bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+	// Create bufferevent socket (TLS-aware for frps control connection)
+	struct bufferevent *bev = NULL;
+	if (tls_is_enabled()) {
+		struct common_conf *c_conf = get_common_config();
+		if (c_conf && strcmp(name, c_conf->server_addr) == 0 && port == c_conf->server_port) {
+			debug(LOG_DEBUG, "Creating TLS connection to %s:%d", name, port);
+			bev = tls_bev_socket_new(base);
+		}
+	}
+	if (!bev) {
+		bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+	}
 	if (!bev) {
 		debug(LOG_ERR, "Failed to create new bufferevent socket");
 		return NULL;
@@ -525,25 +545,6 @@ struct bufferevent *connect_server(struct event_base *base, const char *name, co
 	if (fd >= 0) {
 		int one = 1;
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-	}
-
-	// Wrap with TLS if enabled AND target is the frps server
-	{
-		int _tls_on = tls_is_enabled();
-		debug(LOG_DEBUG, "TLS check: tls_is_enabled=%d, name=%s, port=%d", _tls_on, name, port);
-	}
-	if (tls_is_enabled()) {
-		struct common_conf *c_conf = get_common_config();
-		if (c_conf && strcmp(name, c_conf->server_addr) == 0 && port == c_conf->server_port) {
-			debug(LOG_DEBUG, "TLS wrapping connection to %s:%d", name, port);
-			struct bufferevent *ssl_bev = tls_wrap_bev(base, bev);
-			if (!ssl_bev) {
-				debug(LOG_ERR, "Failed to wrap connection with TLS");
-				/* bev was consumed/freed by tls_wrap_bev on failure */
-				return NULL;
-			}
-			return ssl_bev;
-		}
 	}
 
 	return bev;
@@ -957,7 +958,7 @@ static void handle_type_start_work_conn(struct msg_hdr *msg, int len, void *ctx)
     struct proxy_client *client = (struct proxy_client *)ctx;
     client->ps = ps;
 
-    int remaining_len = len - sizeof(struct msg_hdr) - msg_hton(msg->length);
+    int remaining_len = len - sizeof(struct msg_hdr) - msg_ntoh(msg->length);
     debug(LOG_DEBUG, "Proxy service [%s] [%s:%d] starting work connection. Remaining data length %d",
           sr->proxy_name, ps->local_ip, ps->local_port, remaining_len);
 
@@ -968,7 +969,7 @@ static void handle_type_start_work_conn(struct msg_hdr *msg, int len, void *ctx)
             SAFE_FREE(sr);
             return;
         }
-        memcpy(tail, msg->data + msg_hton(msg->length), remaining_len);
+        memcpy(tail, msg->data + msg_ntoh(msg->length), remaining_len);
         client->data_tail = tail;
         client->data_tail_size = remaining_len;
         debug(LOG_DEBUG, "Data tail copied (%d bytes)", remaining_len);
@@ -1167,7 +1168,7 @@ static int handle_login_response(const uint8_t *buf, int len)
 
 	is_login = 1;
 	
-	int login_len = msg_hton(mhdr->length);
+	int login_len = msg_ntoh(mhdr->length);
 	int remaining_len = len - login_len - sizeof(struct msg_hdr);
 	
 	debug(LOG_INFO, "Login successful - message length: %d, total length: %d, remaining: %d", 
@@ -1175,6 +1176,12 @@ static int handle_login_response(const uint8_t *buf, int len)
 
 	if (remaining_len > 0) {
 		handle_remaining_data(mhdr, login_len, remaining_len);
+	}
+
+	struct common_conf *c_conf = get_common_config();
+	if (c_conf && c_conf->tcp_mux) {
+		start_proxy_services();
+		set_xfrpc_status(true);
 	}
 
 	return 1;
@@ -1442,15 +1449,15 @@ static void handle_connection_failure(struct common_conf *c_conf, int *retry_tim
 static void handle_connection_success(struct bufferevent *bev) {
 	debug(LOG_INFO, "Successfully connected to xfrp server");
 	struct common_conf *c_conf = get_common_config();
-	debug(LOG_DEBUG, "handle_connection_success: tcp_mux=%d", c_conf->tcp_mux);
+	debug(LOG_ERR, "control connection ready, tcp_mux=%d", c_conf ? c_conf->tcp_mux : -1);
 	
-	// Initialize window and login
+	// Initialize window and login (match frpc: open stream then write login back-to-back)
 	if (c_conf->tcp_mux) {
 		send_window_update(bev, &main_ctl->stream, 0);
 	}
 	login();
-	
-	// Flush TLS output buffer
+
+	// Flush TLS output buffer once for the whole handshake burst
 	if (tls_is_enabled()) {
 		bufferevent_flush(bev, EV_WRITE, BEV_FLUSH);
 	}
@@ -1680,9 +1687,29 @@ static int prepare_login_message(char **msg_out, int *len_out) {
  *
  * @note This function does not take any parameters and does not return a value
  */
+void try_send_pending_login(void)
+{
+	struct common_conf *c_conf;
+
+	if (!login_pending || !main_ctl) {
+		return;
+	}
+
+	c_conf = get_common_config();
+	if (c_conf && c_conf->tcp_mux && main_ctl->stream.state != ESTABLISHED) {
+		debug(LOG_DEBUG, "Deferring login until control stream %u is established (state=%d)",
+			  main_ctl->stream.id, main_ctl->stream.state);
+		return;
+	}
+
+	login_pending = 0;
+	login();
+}
+
 void login(void) {
 	char *login_msg = NULL;
 	int msg_len = 0;
+	struct common_conf *c_conf = get_common_config();
 
 	// Prepare login message
 	if (prepare_login_message(&login_msg, &msg_len) != 0) {
@@ -1691,8 +1718,8 @@ void login(void) {
 	}
 
 	// Send login request
-	debug(LOG_DEBUG, "Sending login request: length=%d", msg_len);
-	send_msg_frp_server(NULL, TypeLogin, login_msg, msg_len, &main_ctl->stream);
+	debug(LOG_INFO, "Sending login request: length=%d", msg_len);
+	send_msg_frp_server(NULL, TypeLogin, login_msg, (size_t)msg_len, &main_ctl->stream);
 
 	// Cleanup
 	SAFE_FREE(login_msg);
@@ -1771,8 +1798,14 @@ void send_msg_frp_server(struct bufferevent *bev,
 		struct evbuffer *tmp = evbuffer_new();
 		if (tmp) {
 			evbuffer_add(tmp, (uint8_t *)req_msg, total_len);
-			if (tmux_stream_write(bout, tmp, stream) < 0) {
+			int sent = tmux_stream_write(bout, tmp, stream);
+			if (sent < 0) {
 				debug(LOG_ERR, "Failed to write message through TCP mux");
+			} else if (sent == 0) {
+				debug(LOG_ERR, "Mux write blocked for type=%c stream=%u state=%d send_window=%u",
+					  (char)type, stream ? stream->id : 0,
+					  stream ? stream->state : -1,
+					  stream ? stream->send_window : 0);
 			}
 			bufferevent_flush(bout, EV_WRITE, BEV_FLUSH);
 			evbuffer_free(tmp);
@@ -2055,7 +2088,7 @@ void send_new_proxy(struct proxy_service *ps) {
 	debug(LOG_DEBUG, "Sending new proxy request: type=%d, name=%s, length=%d", 
 		  TypeNewProxy, ps->proxy_name, msg_len);
 
-	send_enc_msg_frp_server(NULL, TypeNewProxy, new_proxy_msg, msg_len, 
+	send_enc_msg_frp_server(NULL, TypeNewProxy, new_proxy_msg, (size_t)msg_len,
 						   &main_ctl->stream);
 
 	SAFE_FREE(new_proxy_msg);
@@ -2145,7 +2178,7 @@ void init_main_control()
 	// Initialize TCP multiplexing if enabled
 	struct common_conf *c_conf = get_common_config();
 	if (c_conf->tcp_mux) {
-		init_tmux_stream(&main_ctl->stream, get_next_session_id(), INIT);
+		init_control_tmux_stream(&main_ctl->stream);
 	}
 
 	// Initialize TLS if enabled (must be before any connection attempts)
@@ -2217,6 +2250,7 @@ static void clear_main_control()
 	// Reset connection state
 	set_xfrpc_status(false);
 	is_login = 0;
+	login_pending = 0;
 	pong_time = 0;
 
 	// Clean up resources
@@ -2226,9 +2260,8 @@ static void clear_main_control()
 	// Reinitialize TCP multiplexing if enabled
 	struct common_conf *conf = get_common_config();
 	if (conf && conf->tcp_mux) {
-		uint32_t session_id = get_next_session_id();
-		init_tmux_stream(&main_ctl->stream, session_id, INIT);
-		debug(LOG_DEBUG, "Reinitialized TCP mux stream with session ID %u", session_id);
+		init_control_tmux_stream(&main_ctl->stream);
+		debug(LOG_DEBUG, "Reinitialized TCP mux control stream %u", CONTROL_STREAM_ID);
 	}
 }
 
@@ -2247,10 +2280,6 @@ void close_main_control()
 		return;
 	}
 
-	// Clean up resources and state
-	clear_main_control();
-
-	// Free event bases
 	if (main_ctl->connect_base) {
 		if (event_base_dispatch(main_ctl->connect_base) < 0) {
 			debug(LOG_ERR, "event_base_dispatch failed");
@@ -2264,6 +2293,8 @@ void close_main_control()
 		event_base_free(main_ctl->connect_base);
 		main_ctl->connect_base = NULL;
 	}
+
+	clear_main_control();
 
 	// Cleanup TLS context
 	tls_cleanup();

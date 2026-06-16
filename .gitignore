@@ -39,6 +39,10 @@ Makefile
 cmake_install.cmake
 install_manifest.txt
 
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
 # bin generated
 xfrpc
 xfrp_test_server
@@ -48,3 +52,4 @@ build
 test/iod_client
 test/iod_server
 test_iod_proto
+.local

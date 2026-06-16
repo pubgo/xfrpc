@@ -41,6 +41,7 @@ void connect_eventcb(struct bufferevent *bev, short events, void *ptr);
 void start_login_frp_server(struct event_base *base);
 void send_login_frp_server(struct bufferevent *bev);
 void login(void);
+void try_send_pending_login(void);
 void send_new_proxy(struct proxy_service *ps);
 
 /* Message handling functions */

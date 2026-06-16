@@ -16,6 +16,8 @@ find_package(JSON-C REQUIRED)
 find_package(ZLIB REQUIRED)
 
 include_directories(
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/third_party/tomlc99
     ${JSON-C_INCLUDE_DIR}
     ${ZLIB_INCLUDE_DIRS}
 )
@@ -50,6 +52,7 @@ set(CORE_SOURCES
     main.c
     client.c
     config.c
+    config_toml.c
     control.c
     ini.c
     msg.c
@@ -63,6 +66,7 @@ set(CORE_SOURCES
     common.c
     login.c
     tls.c
+    third_party/tomlc99/toml.c
 )
 
 set(PROXY_SOURCES

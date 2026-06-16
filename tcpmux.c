@@ -220,23 +220,25 @@ void tcp_mux_encode(enum tcp_mux_type type, enum tcp_mux_flag flags,
  * @brief Gets the TCP multiplexing configuration flag.
  */
 static uint32_t tcp_mux_flag() {
-    static int cached = -1;
-    if (__builtin_expect(cached >= 0, 1))
-        return cached;
     struct common_conf *c_conf = get_common_config();
     if (!c_conf) {
         debug(LOG_ERR, "Failed to get common configuration");
         return 0;
     }
-    cached = c_conf->tcp_mux;
-    return cached;
+    return c_conf->tcp_mux;
 }
 
 /**
  * @brief Resets the global session ID to its initial value.
  */
 void reset_session_id() {
-    __atomic_store_n(&g_session_id, 1, __ATOMIC_SEQ_CST);
+    /* Control traffic always uses stream 1; work streams start at 3. */
+    __atomic_store_n(&g_session_id, CONTROL_STREAM_ID + 2, __ATOMIC_SEQ_CST);
+}
+
+void init_control_tmux_stream(struct tmux_stream *stream) {
+    init_tmux_stream(stream, CONTROL_STREAM_ID, INIT);
+    reset_session_id();
 }
 
 /**
@@ -522,7 +524,11 @@ void send_window_update(struct bufferevent *bout, struct tmux_stream *stream, ui
     if (length == 0) {
         enum tcp_mux_flag flags = get_send_flags(stream);
         if (flags != ZERO) {
-            tcp_mux_send_win_update(bout, flags, stream->id, 0);
+            uint32_t delta = 0;
+            if (flags & SYN) {
+                delta = MAX_YAMUX_WINDOW_SIZE - INITIAL_STREAM_WINDOW_SIZE;
+            }
+            tcp_mux_send_win_update(bout, flags, stream->id, delta);
         }
         return;
     }
@@ -705,6 +711,10 @@ static int incr_send_window(struct bufferevent *bev,
 
     debug(LOG_DEBUG, "WUP recv stream=%u inc=%u sw %u->%u",
           stream_id, increment, old_window, stream->send_window);
+
+    if (stream_id == CONTROL_STREAM_ID && stream->state == ESTABLISHED) {
+        try_send_pending_login();
+    }
 
     if (stream->send_window == 0) {
         return 1;

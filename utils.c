@@ -21,10 +21,19 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <ifaddrs.h>
+#ifdef __linux__
 #include <linux/if_link.h>
+#else
+#include <net/if_dl.h>
+#endif
 #include <stdbool.h>
 
 #include "utils.h"
+
+/* macOS uses AF_LINK for link-layer interfaces instead of Linux's AF_PACKET */
+#ifndef AF_PACKET
+#define AF_PACKET AF_LINK
+#endif
 
 /**
  * High precision sleep function using select
@@ -75,13 +84,14 @@ int is_valid_ip_address(const char *ip_address)
  */
 int get_net_mac(const char *net_if_name, char *mac, int mac_len) 
 {
-	struct ifreq ifreq;
-	int sock;
-
 	// Validate input parameters
 	if (!net_if_name || !mac || mac_len < 12) {
 		return 1;
 	}
+
+#ifdef __linux__
+	struct ifreq ifreq;
+	int sock;
 
 	// Create socket for interface communication
 	sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -109,6 +119,36 @@ int get_net_mac(const char *net_if_name, char *mac, int mac_len)
 
 	close(sock);
 	return 0;
+#else
+	// BSD/macOS: obtain the link-layer (MAC) address via getifaddrs()
+	struct ifaddrs *ifaddr = NULL, *ifa = NULL;
+	if (getifaddrs(&ifaddr) == -1) {
+		perror("getifaddrs");
+		return 1;
+	}
+
+	int ret = 1;
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_LINK)
+			continue;
+		if (strcmp(ifa->ifa_name, net_if_name) != 0)
+			continue;
+
+		struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+		if (sdl->sdl_alen != 6)
+			continue;
+
+		unsigned char *ptr = (unsigned char *)LLADDR(sdl);
+		for (int i = 0; i < 6; i++) {
+			snprintf(mac + (i * 2), mac_len - (i * 2), "%02X", ptr[i]);
+		}
+		ret = 0;
+		break;
+	}
+
+	freeifaddrs(ifaddr);
+	return ret;
+#endif
 }
 
 /**
@@ -163,11 +203,13 @@ int show_net_ifname()
 		}
 		// Handle packet statistics
 		else if (family == AF_PACKET && ifa->ifa_data != NULL) {
+#ifdef __linux__
 			struct rtnl_link_stats *stats = (struct rtnl_link_stats *)ifa->ifa_data;
 			printf("\t\ttx_packets = %10u; rx_packets = %10u\n"
 				   "\t\ttx_bytes   = %10u; rx_bytes   = %10u\n",
 				   stats->tx_packets, stats->rx_packets,
 				   stats->tx_bytes, stats->rx_bytes);
+#endif
 		}
 	}
 

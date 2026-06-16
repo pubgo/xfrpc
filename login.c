@@ -105,6 +105,14 @@ void init_login()
 	c_login->privilege_key = NULL;
 	c_login->logged = 0;
 
+	if (c_conf->user && *c_conf->user) {
+		c_login->user = strdup(c_conf->user);
+		if (!c_login->user) {
+			debug(LOG_ERR, "Failed to allocate memory for login user");
+			exit(1);
+		}
+	}
+
 	// Get network interface information
 	char ifname[16] = {0};
 	if (get_net_ifname(ifname, sizeof(ifname)) != 0) {
