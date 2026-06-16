@@ -84,19 +84,34 @@ int tls_init(void)
 	SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
 
 	/* Load trusted CA certificate for server verification */
-	if (conf->tls_trusted_ca_file) {
-		if (SSL_CTX_load_verify_locations(g_ssl_ctx, conf->tls_trusted_ca_file, NULL) != 1) {
-			debug(LOG_ERR, "[TLS] Failed to load CA file: %s", conf->tls_trusted_ca_file);
+	const char *ca_file = NULL;
+	if (conf->tls_trusted_ca_file && *conf->tls_trusted_ca_file) {
+		ca_file = conf->tls_trusted_ca_file;
+	} else {
+		const char *env_ca = getenv("SSL_CERT_FILE");
+		if (env_ca && *env_ca) {
+			ca_file = env_ca;
+		} else {
+			const char *env_dir = getenv("SSL_CERT_DIR");
+			static char default_ca[512];
+			if (env_dir && *env_dir) {
+				snprintf(default_ca, sizeof(default_ca), "%s/ca-certificates.crt", env_dir);
+				ca_file = default_ca;
+			}
+		}
+	}
+
+	if (ca_file && *ca_file) {
+		if (SSL_CTX_load_verify_locations(g_ssl_ctx, ca_file, NULL) != 1) {
+			debug(LOG_ERR, "[TLS] Failed to load CA file: %s", ca_file);
 			tls_log_errors("SSL_CTX_load_verify_locations");
 			SSL_CTX_free(g_ssl_ctx);
 			g_ssl_ctx = NULL;
 			return -1;
 		}
-		/* Enable certificate verification */
 		SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, tls_verify_callback);
-		debug(LOG_DEBUG, "[TLS] CA file loaded: %s", conf->tls_trusted_ca_file);
+		debug(LOG_DEBUG, "[TLS] CA file loaded: %s", ca_file);
 	} else {
-		/* No CA file: still verify peer but use system defaults */
 		SSL_CTX_set_default_verify_paths(g_ssl_ctx);
 		SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, tls_verify_callback);
 		debug(LOG_DEBUG, "[TLS] Using system default CA store");
