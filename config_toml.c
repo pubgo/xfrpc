@@ -230,6 +230,11 @@ static void load_toml_proxy(struct proxy_service *ps, const toml_table_t *proxy)
 				config_set_proxy_field(ps, "http_referer", referer.u.s);
 				free(referer.u.s);
 			}
+			toml_datum_t origin = toml_string_in(set, "Origin");
+			if (origin.ok && origin.u.s) {
+				config_set_proxy_field(ps, "http_origin", origin.u.s);
+				free(origin.u.s);
+			}
 		}
 	}
 }

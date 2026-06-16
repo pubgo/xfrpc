@@ -492,10 +492,18 @@ int new_proxy_service_marshal(const struct proxy_service *np_req, char **msg)
 	JSON_MARSHAL_TYPE(j_np_req, "http_user", string, SAFE_JSON_STRING(np_req->http_user));
 	JSON_MARSHAL_TYPE(j_np_req, "http_pwd", string, SAFE_JSON_STRING(np_req->http_pwd));
 
-	if (np_req->http_referer && *np_req->http_referer) {
+	if ((np_req->http_referer && *np_req->http_referer) ||
+		(np_req->http_origin && *np_req->http_origin)) {
 		struct json_object *headers = json_object_new_object();
 		if (headers) {
-			json_object_object_add(headers, "Referer", json_object_new_string(np_req->http_referer));
+			if (np_req->http_referer && *np_req->http_referer) {
+				json_object_object_add(headers, "Referer",
+					json_object_new_string(np_req->http_referer));
+			}
+			if (np_req->http_origin && *np_req->http_origin) {
+				json_object_object_add(headers, "Origin",
+					json_object_new_string(np_req->http_origin));
+			}
 			/* frp NewProxy uses "headers", not "request_headers" (see pkg/msg/msg.go) */
 			json_object_object_add(j_np_req, "headers", headers);
 		}
