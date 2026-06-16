@@ -236,7 +236,13 @@ static uint32_t tcp_mux_flag() {
  * @brief Resets the global session ID to its initial value.
  */
 void reset_session_id() {
-    __atomic_store_n(&g_session_id, 1, __ATOMIC_SEQ_CST);
+    /* Control traffic always uses stream 1; work streams start at 3. */
+    __atomic_store_n(&g_session_id, CONTROL_STREAM_ID + 2, __ATOMIC_SEQ_CST);
+}
+
+void init_control_tmux_stream(struct tmux_stream *stream) {
+    init_tmux_stream(stream, CONTROL_STREAM_ID, INIT);
+    reset_session_id();
 }
 
 /**

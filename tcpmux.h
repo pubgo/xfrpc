@@ -77,8 +77,15 @@ typedef void (*handle_data_fn_t)(uint8_t *, int, void *);
 /**
  * @brief Initializes TCP MUX stream.
  */
+#define CONTROL_STREAM_ID 1
+
 void init_tmux_stream(struct tmux_stream *stream, uint32_t id,
                       enum tcp_mux_state state);
+
+/**
+ * @brief Initialize the fixed control stream (yamux stream 1).
+ */
+void init_control_tmux_stream(struct tmux_stream *stream);
 
 /**
  * @brief Validates a TCP MUX protocol.

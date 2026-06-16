@@ -1168,6 +1168,12 @@ static int handle_login_response(const uint8_t *buf, int len)
 		handle_remaining_data(mhdr, login_len, remaining_len);
 	}
 
+	struct common_conf *c_conf = get_common_config();
+	if (c_conf && c_conf->tcp_mux) {
+		start_proxy_services();
+		set_xfrpc_status(true);
+	}
+
 	return 1;
 }
 
@@ -2136,7 +2142,7 @@ void init_main_control()
 	// Initialize TCP multiplexing if enabled
 	struct common_conf *c_conf = get_common_config();
 	if (c_conf->tcp_mux) {
-		init_tmux_stream(&main_ctl->stream, get_next_session_id(), INIT);
+		init_control_tmux_stream(&main_ctl->stream);
 	}
 
 	// Initialize TLS if enabled (must be before any connection attempts)
@@ -2217,9 +2223,8 @@ static void clear_main_control()
 	// Reinitialize TCP multiplexing if enabled
 	struct common_conf *conf = get_common_config();
 	if (conf && conf->tcp_mux) {
-		uint32_t session_id = get_next_session_id();
-		init_tmux_stream(&main_ctl->stream, session_id, INIT);
-		debug(LOG_DEBUG, "Reinitialized TCP mux stream with session ID %u", session_id);
+		init_control_tmux_stream(&main_ctl->stream);
+		debug(LOG_DEBUG, "Reinitialized TCP mux control stream %u", CONTROL_STREAM_ID);
 	}
 }
 
