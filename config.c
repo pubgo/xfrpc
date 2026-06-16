@@ -308,6 +308,7 @@ static struct proxy_service *new_proxy_service(const char *name)
 	ps->host_header_rewrite = NULL;
 	ps->http_referer = NULL;
 	ps->http_origin = NULL;
+	ps->request_headers = NULL;
 	ps->http_user = NULL;
 	ps->http_pwd = NULL;
 
@@ -732,6 +733,7 @@ int config_set_proxy_field(struct proxy_service *ps, const char *nm, const char 
 	else if (MATCH_NAME("http_pwd")) SET_STRING_VALUE(http_pwd);
 	else if (MATCH_NAME("http_referer")) SET_STRING_VALUE(http_referer);
 	else if (MATCH_NAME("http_origin")) SET_STRING_VALUE(http_origin);
+	else if (MATCH_NAME("request_headers")) SET_STRING_VALUE(request_headers);
 	else if (MATCH_NAME("subdomain")) SET_STRING_VALUE(subdomain);
 	else if (MATCH_NAME("custom_domains")) SET_STRING_VALUE(custom_domains);
 	else if (MATCH_NAME("locations")) SET_STRING_VALUE(locations);
@@ -1034,6 +1036,7 @@ void free_proxy_service(struct proxy_service *ps)
 	SAFE_FREE(ps->host_header_rewrite);
 	SAFE_FREE(ps->http_referer);
 	SAFE_FREE(ps->http_origin);
+	SAFE_FREE(ps->request_headers);
 	SAFE_FREE(ps->http_user);
 	SAFE_FREE(ps->http_pwd);
 	SAFE_FREE(ps->group);

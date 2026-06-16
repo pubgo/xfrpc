@@ -119,6 +119,7 @@ struct proxy_service {
 	char    *host_header_rewrite;
 	char    *http_referer;
 	char    *http_origin;
+	char    *request_headers;
 	char    *http_user;
 	char    *http_pwd;
 

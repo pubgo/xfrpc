@@ -171,6 +171,33 @@ static void apply_proxy_int(struct proxy_service *ps, const char *ini_key, const
 	config_set_proxy_field(ps, ini_key, buf);
 }
 
+static void append_proxy_request_header(struct proxy_service *ps, const char *key, const char *value)
+{
+	if (!ps || !key || !value || !*key) {
+		return;
+	}
+
+	const char *existing = ps->request_headers ? ps->request_headers : "";
+	size_t existing_len = strlen(existing);
+	size_t key_len = strlen(key);
+	size_t value_len = strlen(value);
+	size_t total_len = existing_len + key_len + 1 + value_len + 1 + 1; /* key \t value \n \0 */
+
+	char *merged = malloc(total_len);
+	if (!merged) {
+		return;
+	}
+	memcpy(merged, existing, existing_len);
+	memcpy(merged + existing_len, key, key_len);
+	merged[existing_len + key_len] = '\t';
+	memcpy(merged + existing_len + key_len + 1, value, value_len);
+	merged[existing_len + key_len + 1 + value_len] = '\n';
+	merged[existing_len + key_len + 1 + value_len + 1] = '\0';
+
+	config_set_proxy_field(ps, "request_headers", merged);
+	free(merged);
+}
+
 static void load_toml_proxy(struct proxy_service *ps, const toml_table_t *proxy)
 {
 	apply_proxy_string(ps, "type", proxy, "type");
@@ -225,6 +252,19 @@ static void load_toml_proxy(struct proxy_service *ps, const toml_table_t *proxy)
 	if (request_headers) {
 		toml_table_t *set = toml_table_in(request_headers, "set");
 		if (set) {
+			int nkv = toml_table_nkval(set);
+			for (int i = 0; i < nkv; i++) {
+				const char *key = toml_key_in(set, i);
+				if (!key) {
+					continue;
+				}
+				toml_datum_t header_val = toml_string_in(set, key);
+				if (header_val.ok && header_val.u.s) {
+					append_proxy_request_header(ps, key, header_val.u.s);
+					free(header_val.u.s);
+				}
+			}
+
 			toml_datum_t referer = toml_string_in(set, "Referer");
 			if (referer.ok && referer.u.s) {
 				config_set_proxy_field(ps, "http_referer", referer.u.s);

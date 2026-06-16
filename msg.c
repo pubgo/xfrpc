@@ -492,10 +492,32 @@ int new_proxy_service_marshal(const struct proxy_service *np_req, char **msg)
 	JSON_MARSHAL_TYPE(j_np_req, "http_user", string, SAFE_JSON_STRING(np_req->http_user));
 	JSON_MARSHAL_TYPE(j_np_req, "http_pwd", string, SAFE_JSON_STRING(np_req->http_pwd));
 
-	if ((np_req->http_referer && *np_req->http_referer) ||
+	if ((np_req->request_headers && *np_req->request_headers) ||
+		(np_req->http_referer && *np_req->http_referer) ||
 		(np_req->http_origin && *np_req->http_origin)) {
 		struct json_object *headers = json_object_new_object();
 		if (headers) {
+			if (np_req->request_headers && *np_req->request_headers) {
+				char *headers_copy = strdup(np_req->request_headers);
+				if (headers_copy) {
+					char *save_line = NULL;
+					char *line = strtok_r(headers_copy, "\n", &save_line);
+					while (line) {
+						char *sep = strchr(line, '\t');
+						if (sep) {
+							*sep = '\0';
+							char *header_key = line;
+							char *header_value = sep + 1;
+							if (*header_key && *header_value) {
+								json_object_object_add(headers, header_key,
+									json_object_new_string(header_value));
+							}
+						}
+						line = strtok_r(NULL, "\n", &save_line);
+					}
+					free(headers_copy);
+				}
+			}
 			if (np_req->http_referer && *np_req->http_referer) {
 				json_object_object_add(headers, "Referer",
 					json_object_new_string(np_req->http_referer));
