@@ -159,19 +159,18 @@ pub fn build(b: *std.Build) void {
 fn addBrewPkgPaths(mod: *std.Build.Module, b: *std.Build, root: []const u8, pkg: []const u8) void {
     const include_dir = b.fmt("{s}/{s}/include", .{ root, pkg });
     defer b.allocator.free(include_dir);
-    if (pathExists(b.allocator, include_dir)) {
+    if (pathExists(b, include_dir)) {
         mod.addIncludePath(.{ .cwd_relative = include_dir });
     }
 
     const lib_dir = b.fmt("{s}/{s}/lib", .{ root, pkg });
     defer b.allocator.free(lib_dir);
-    if (pathExists(b.allocator, lib_dir)) {
+    if (pathExists(b, lib_dir)) {
         mod.addLibraryPath(.{ .cwd_relative = lib_dir });
     }
 }
 
-fn pathExists(allocator: std.mem.Allocator, path: []const u8) bool {
-    const path_z = allocator.dupeZ(u8, path) catch return false;
-    defer allocator.free(path_z);
-    return std.c.access(path_z, std.c.F_OK) == 0;
+fn pathExists(b: *std.Build, path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch return false;
+    return true;
 }
