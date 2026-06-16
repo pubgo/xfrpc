@@ -526,7 +526,7 @@ void send_window_update(struct bufferevent *bout, struct tmux_stream *stream, ui
         if (flags != ZERO) {
             uint32_t delta = 0;
             if (flags & SYN) {
-                delta = MAX_YAMUX_WINDOW_SIZE;
+                delta = MAX_YAMUX_WINDOW_SIZE - INITIAL_STREAM_WINDOW_SIZE;
             }
             tcp_mux_send_win_update(bout, flags, stream->id, delta);
         }
@@ -711,6 +711,10 @@ static int incr_send_window(struct bufferevent *bev,
 
     debug(LOG_DEBUG, "WUP recv stream=%u inc=%u sw %u->%u",
           stream_id, increment, old_window, stream->send_window);
+
+    if (stream_id == CONTROL_STREAM_ID && stream->state == ESTABLISHED) {
+        try_send_pending_login();
+    }
 
     if (stream->send_window == 0) {
         return 1;

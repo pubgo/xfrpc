@@ -655,10 +655,16 @@ int config_set_common_field(struct common_conf *config, const char *name, const 
 		config->auth_method = strdup(value);
 		assert(config->auth_method);
 	}
-	else if (strcmp(name, "token") == 0 || strcmp(name, "auth_token") == 0) {
+	else if (strcmp(name, "auth_token") == 0 || strcmp(name, "token") == 0) {
 		SAFE_FREE(config->auth_token);
 		config->auth_token = strdup(value);
 		assert(config->auth_token);
+	}
+	else if (strcmp(name, "auth_scope_heartbeats") == 0) {
+		config->auth_scope_heartbeats = !!atoi(value);
+	}
+	else if (strcmp(name, "auth_scope_new_work_conns") == 0) {
+		config->auth_scope_new_work_conns = !!atoi(value);
 	}
 	else if (strcmp(name, "heartbeat_interval") == 0) {
 		config->heartbeat_interval = atoi(value);

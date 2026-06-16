@@ -88,6 +88,28 @@ static void apply_toml_int_field(struct common_conf *config, const char *field, 
 	config_set_common_field(config, field, buf);
 }
 
+static void apply_auth_additional_scopes(struct common_conf *config, const toml_table_t *auth)
+{
+	toml_array_t *scopes = toml_array_in(auth, "additionalScopes");
+	if (!scopes) {
+		return;
+	}
+
+	int count = toml_array_nelem(scopes);
+	for (int i = 0; i < count; i++) {
+		toml_datum_t item = toml_string_at(scopes, i);
+		if (!item.ok || !item.u.s) {
+			continue;
+		}
+		if (strcmp(item.u.s, "HeartBeats") == 0) {
+			config->auth_scope_heartbeats = 1;
+		} else if (strcmp(item.u.s, "NewWorkConns") == 0) {
+			config->auth_scope_new_work_conns = 1;
+		}
+		free(item.u.s);
+	}
+}
+
 static void load_toml_common(struct common_conf *config, const toml_table_t *root)
 {
 	copy_toml_string(config, "user", root, "user");
@@ -99,6 +121,7 @@ static void load_toml_common(struct common_conf *config, const toml_table_t *roo
 	if (auth) {
 		copy_toml_string(config, "auth_method", auth, "method");
 		copy_toml_string(config, "auth_token", auth, "token");
+		apply_auth_additional_scopes(config, auth);
 	}
 
 	toml_table_t *transport = toml_table_in(root, "transport");

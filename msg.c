@@ -233,6 +233,73 @@ int common_conf_uses_jwt_auth(const struct common_conf *cf)
 	return 0;
 }
 
+int common_conf_auth_scope_heartbeats(const struct common_conf *cf)
+{
+	if (!cf) {
+		return 0;
+	}
+	if (cf->auth_scope_heartbeats) {
+		return 1;
+	}
+	return common_conf_uses_jwt_auth(cf);
+}
+
+int common_conf_auth_scope_new_work_conns(const struct common_conf *cf)
+{
+	if (!cf) {
+		return 0;
+	}
+	if (cf->auth_scope_new_work_conns) {
+		return 1;
+	}
+	return common_conf_uses_jwt_auth(cf);
+}
+
+static void json_add_privilege_key(struct json_object *jobj, const struct common_conf *cf)
+{
+	if (!cf || !cf->auth_token || !*cf->auth_token) {
+		return;
+	}
+	JSON_MARSHAL_TYPE(jobj, "privilege_key", string, cf->auth_token);
+}
+
+/**
+ * @brief Marshals a heartbeat ping message for the FRP server
+ */
+int ping_request_marshal(char **msg)
+{
+	if (!msg) {
+		return 0;
+	}
+
+	struct common_conf *cf = get_common_config();
+	struct json_object *j_ping = json_object_new_object();
+	if (!j_ping) {
+		return 0;
+	}
+
+	if (common_conf_auth_scope_heartbeats(cf)) {
+		json_add_privilege_key(j_ping, cf);
+		if (sizeof(time_t) == 4) {
+			JSON_MARSHAL_TYPE(j_ping, "timestamp", int, (int)time(NULL));
+		} else {
+			JSON_MARSHAL_TYPE(j_ping, "timestamp", int64, (int64_t)time(NULL));
+		}
+	}
+
+	const char *json_str = json_object_to_json_string(j_ping);
+	int nret = 0;
+	if (json_str && strlen(json_str) > 0) {
+		*msg = strdup(json_str);
+		if (*msg) {
+			nret = (int)strlen(json_str);
+		}
+	}
+
+	json_object_put(j_ping);
+	return nret;
+}
+
 /**
  * @brief Marshals login request data into a JSON string
  *
@@ -283,7 +350,9 @@ size_t login_request_marshal(char **msg)
 
 	// Add required fields
 	JSON_MARSHAL_TYPE(j_login_req, "version", string, lg->version);
-	JSON_MARSHAL_TYPE(j_login_req, "hostname", string, SAFE_JSON_STRING(lg->hostname));
+	if (lg->hostname && *lg->hostname) {
+		JSON_MARSHAL_TYPE(j_login_req, "hostname", string, lg->hostname);
+	}
 	JSON_MARSHAL_TYPE(j_login_req, "os", string, lg->os);
 	JSON_MARSHAL_TYPE(j_login_req, "arch", string, lg->arch);
 	JSON_MARSHAL_TYPE(j_login_req, "privilege_key", string, lg->privilege_key);
@@ -300,13 +369,16 @@ size_t login_request_marshal(char **msg)
 	if (lg->user) {
 		JSON_MARSHAL_TYPE(j_login_req, "user", string, lg->user);
 	}
-	if (lg->run_id) {
+	if (!is_logged() && lg->run_id && *lg->run_id) {
+		/* first login: omit run_id like official frpc (omitempty) */
+	} else if (lg->run_id && *lg->run_id) {
 		JSON_MARSHAL_TYPE(j_login_req, "run_id", string, lg->run_id);
 	}
 
 	// Convert to string
 	size_t nret = 0;
-	const char *json_str = json_object_to_json_string(j_login_req);
+	const char *json_str = json_object_to_json_string_ext(j_login_req,
+		JSON_C_TO_STRING_PLAIN);
 	if (json_str && strlen(json_str) > 0) {
 		*msg = strdup(json_str);
 		if (*msg) {
@@ -504,6 +576,16 @@ int new_work_conn_marshal(const struct work_conn *work_c, char **msg)
 
 	// Add run_id field
 	JSON_MARSHAL_TYPE(j_new_work_conn, "run_id", string, SAFE_JSON_STRING(work_c->run_id));
+
+	struct common_conf *cf = get_common_config();
+	if (common_conf_auth_scope_new_work_conns(cf)) {
+		json_add_privilege_key(j_new_work_conn, cf);
+		if (sizeof(time_t) == 4) {
+			JSON_MARSHAL_TYPE(j_new_work_conn, "timestamp", int, (int)time(NULL));
+		} else {
+			JSON_MARSHAL_TYPE(j_new_work_conn, "timestamp", int64, (int64_t)time(NULL));
+		}
+	}
 
 	// Convert to JSON string
 	const char *json_str = json_object_to_json_string(j_new_work_conn);

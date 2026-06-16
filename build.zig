@@ -88,7 +88,8 @@ pub fn build(b: *std.Build) void {
 
     // On macOS, dependencies are typically installed via Homebrew. Add the
     // common Apple Silicon (/opt/homebrew) and Intel (/usr/local) prefixes so
-    // headers/libs are found. Non-existent dirs only yield a harmless warning.
+    // headers/libs are found. Skip paths that do not exist (Zig 0.16+ errors
+    // on missing -L directories).
     // When an explicit dep-prefix is given (e.g. a static sysroot built by
     // scripts/build-macos-deps.sh) we skip Homebrew so that prefix is the sole,
     // authoritative source of the dependencies.
@@ -97,8 +98,7 @@ pub fn build(b: *std.Build) void {
         const pkgs = [_][]const u8{ "openssl@3", "libevent", "json-c", "zlib" };
         for (brew_opt) |root| {
             for (pkgs) |pkg| {
-                mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/{s}/include", .{ root, pkg }) });
-                mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}/lib", .{ root, pkg }) });
+                addBrewPkgPaths(mod, b, root, pkg);
             }
         }
     }
@@ -154,4 +154,24 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Build and run xfrpc");
     run_step.dependOn(&run_cmd.step);
+}
+
+fn addBrewPkgPaths(mod: *std.Build.Module, b: *std.Build, root: []const u8, pkg: []const u8) void {
+    const include_dir = b.fmt("{s}/{s}/include", .{ root, pkg });
+    defer b.allocator.free(include_dir);
+    if (pathExists(b.allocator, include_dir)) {
+        mod.addIncludePath(.{ .cwd_relative = include_dir });
+    }
+
+    const lib_dir = b.fmt("{s}/{s}/lib", .{ root, pkg });
+    defer b.allocator.free(lib_dir);
+    if (pathExists(b.allocator, lib_dir)) {
+        mod.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+}
+
+fn pathExists(allocator: std.mem.Allocator, path: []const u8) bool {
+    const path_z = allocator.dupeZ(u8, path) catch return false;
+    defer allocator.free(path_z);
+    return std.c.access(path_z, std.c.F_OK) == 0;
 }

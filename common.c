@@ -6,23 +6,28 @@
 
 #include "uthash.h"
 #include "common.h"
+#include <stdint.h>
+
+static int is_little_endian(void)
+{
+	const uint16_t probe = 0x0100;
+	return *((const uint8_t *)&probe) == 0;
+}
 
 uint64_t ntoh64(const uint64_t input)
 {
-#if __BYTE_ORDER == __BIG_ENDIAN
-    return input;
+	if (!is_little_endian()) {
+		return input;
+	}
+#if defined(__GNUC__) || defined(__clang__)
+	return __builtin_bswap64(input);
 #else
-    return ((uint64_t)ntohl(input & 0xFFFFFFFF) << 32) | 
-           ntohl((input >> 32) & 0xFFFFFFFF);
+	return ((uint64_t)ntohl((uint32_t)(input & 0xFFFFFFFF)) << 32) |
+	       (uint64_t)ntohl((uint32_t)(input >> 32));
 #endif
 }
 
 uint64_t hton64(const uint64_t input)
 {
-#if __BYTE_ORDER == __BIG_ENDIAN
-    return input;
-#else
-    return ((uint64_t)htonl(input & 0xFFFFFFFF) << 32) | 
-           htonl((input >> 32) & 0xFFFFFFFF);
-#endif
+	return ntoh64(input);
 }

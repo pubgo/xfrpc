@@ -11,6 +11,7 @@
 
 #define MAX_STREAM_WINDOW_SIZE (8 * 1024 * 1024)  // 8MB to match frps server
 #define MAX_YAMUX_WINDOW_SIZE  (6 * 1024 * 1024)  // 6MB to match frps MaxStreamWindowSize
+#define INITIAL_STREAM_WINDOW_SIZE (256 * 1024)   // matches hashicorp/yamux initialStreamWindow
 #define DEFAULT_MAX_FRAME_SIZE (256 * 1024)         // 32KB max frame size (matches yamux/smux)
 
 enum go_away_type {

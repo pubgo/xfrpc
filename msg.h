@@ -101,6 +101,7 @@ struct start_work_conn_resp {
 int new_udp_packet_marshal(const struct udp_packet *udp, char **msg);
 int new_proxy_service_marshal(const struct proxy_service *np_req, char **msg);
 int new_work_conn_marshal(const struct work_conn *work_c, char **msg);
+int ping_request_marshal(char **msg);
 size_t login_request_marshal(char **msg);
 
 
