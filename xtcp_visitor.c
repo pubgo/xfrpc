@@ -524,12 +524,15 @@ static void xtcp_handle_nat_hole_resp_impl(struct xtcp_session *sess,
 	for (int i = 0; i < resp->candidate_addrs_count && i < MAX_CANDIDATE_ADDRS; i++) {
 		sess->candidate_addrs[i] = strdup(resp->candidate_addrs[i]);
 	}
-	sess->candidate_addrs_count = resp->candidate_addrs_count;
+	/* store the clamped count, never the server-supplied one */
+	sess->candidate_addrs_count = resp->candidate_addrs_count > MAX_CANDIDATE_ADDRS ?
+		MAX_CANDIDATE_ADDRS : resp->candidate_addrs_count;
 
 	for (int i = 0; i < resp->assisted_addrs_count && i < MAX_CANDIDATE_ADDRS; i++) {
 		sess->assisted_addrs[i] = strdup(resp->assisted_addrs[i]);
 	}
-	sess->assisted_addrs_count = resp->assisted_addrs_count;
+	sess->assisted_addrs_count = resp->assisted_addrs_count > MAX_CANDIDATE_ADDRS ?
+		MAX_CANDIDATE_ADDRS : resp->assisted_addrs_count;
 
 	/* Parse detect behavior */
 	sess->is_sender = (resp->behavior_role && strcmp(resp->behavior_role, "sender") == 0);

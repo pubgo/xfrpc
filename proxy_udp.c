@@ -281,6 +281,9 @@ void udp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
         return;
     }
 
+    /* Declared before any goto: jumping to cleanup over this
+     * initialization would free() an indeterminate pointer. */
+    char *json_buf = NULL;
     struct evbuffer *src = bufferevent_get_input(bev);
     struct evbuffer *base64_output = evbuffer_new();
     if (!base64_output) {
@@ -309,7 +312,6 @@ void udp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
     raddr->port = client->ps->local_port;
 
     // Marshal UDP packet to JSON
-    char *json_buf = NULL;
     if (new_udp_packet_marshal(udp_pkt, &json_buf) < 0 || !json_buf) {
         debug(LOG_ERR, "UDP packet marshalling failed");
         goto cleanup;

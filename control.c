@@ -1121,16 +1121,32 @@ static char *msg_data_to_json(const struct msg_hdr *msg)
 static void handle_control_work(const uint8_t *buf, int len, void *ctx)
 {
 	uint8_t *frps_cmd = NULL;
+	int flen = 0;
 
 	if (!ctx) {
-		if (handle_enc_msg(buf, len, &frps_cmd) <= 0 || !frps_cmd) {
+		int dlen = handle_enc_msg(buf, len, &frps_cmd);
+		if (dlen <= 0 || !frps_cmd) {
 			return;
 		}
+		flen = dlen;
 	} else {
 		frps_cmd = (uint8_t *)buf;
+		flen = len;
 	}
 
 	struct msg_hdr *msg = (struct msg_hdr *)frps_cmd;
+
+	/* The length field is server-controlled: never let it drive a
+	 * memcpy() past the received buffer. */
+	if (flen < (int)sizeof(struct msg_hdr) ||
+	    (int)msg_hton(msg->length) > flen - (int)sizeof(struct msg_hdr)) {
+		debug(LOG_ERR, "Invalid message length %d (buffer %d), dropping",
+		      (int)msg_hton(msg->length), flen);
+		if (!ctx)
+			free(frps_cmd);
+		return;
+	}
+
 	uint8_t cmd_type = msg->type;
 
 	switch (cmd_type) {
@@ -1141,7 +1157,9 @@ static void handle_control_work(const uint8_t *buf, int len, void *ctx)
 		handle_type_new_proxy_resp(msg);
 		break;
 	case TypeStartWorkConn:
-		handle_type_start_work_conn(msg, len, ctx);
+		/* flen is the decrypted buffer size (or the plaintext size when
+		 * unencrypted); the header/length arithmetic inside must use it. */
+		handle_type_start_work_conn(msg, flen, ctx);
 		break;
 	case TypeUDPPacket:
 		handle_type_udp_packet(msg, ctx);

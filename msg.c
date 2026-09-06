@@ -1212,6 +1212,8 @@ int nathole_report_marshal(const struct nathole_report_msg *msg, char **out)
 }
 
 /* Helper to parse a JSON string array field */
+#define MAX_PARSED_ADDRS 64
+
 static int parse_json_string_array(struct json_object *jobj, const char *key,
 				   char ***out_arr, int *out_count)
 {
@@ -1223,6 +1225,9 @@ static int parse_json_string_array(struct json_object *jobj, const char *key,
 	}
 
 	int count = json_object_array_length(jarr);
+	/* bound the allocation: the array comes from the network */
+	if (count > MAX_PARSED_ADDRS)
+		count = MAX_PARSED_ADDRS;
 	if (count <= 0) {
 		*out_arr = NULL;
 		*out_count = 0;
@@ -1234,9 +1239,9 @@ static int parse_json_string_array(struct json_object *jobj, const char *key,
 
 	for (int i = 0; i < count; i++) {
 		struct json_object *item = json_object_array_get_idx(jarr, i);
-		if (item) {
-			arr[i] = strdup(json_object_get_string(item));
-		}
+		const char *str = item ? json_object_get_string(item) : NULL;
+		if (str)
+			arr[i] = strdup(str);
 	}
 
 	*out_arr = arr;
