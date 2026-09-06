@@ -302,6 +302,12 @@ int tls_load_certs_to_ctx(void *vctx)
 			debug(LOG_INFO, "[TLS/QUIC] CA loaded: %s",
 			      conf->tls_trusted_ca_file);
 		}
+	} else {
+		/* No CA file: still verify the peer against system defaults
+		 * instead of silently running unverified. */
+		SSL_CTX_set_default_verify_paths(ctx);
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, tls_verify_callback);
+		debug(LOG_INFO, "[TLS/QUIC] Using system default CA store");
 	}
 
 	/* Load client certificate (for mTLS) */

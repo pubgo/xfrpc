@@ -34,8 +34,11 @@ static struct proxy_client 	*all_pc = NULL;
  * @brief Event callback for worker connection events
  */
 static void xfrp_worker_event_cb(struct bufferevent *bev, short what, void *ctx) {
+	struct proxy_client *client = (struct proxy_client *)ctx;
 	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
 		debug(LOG_DEBUG, "Working connection closed");
+		if (client && client->ctl_bev == bev)
+			client->ctl_bev = NULL;
 		bufferevent_free(bev);
 	}
 }
@@ -454,6 +457,12 @@ free_proxy_client(struct proxy_client *client)
 	if (client->local_proxy_bev) {
 		bufferevent_free(client->local_proxy_bev);
 		client->local_proxy_bev = NULL;
+	}
+
+	/* Free stashed encrypted data */
+	if (client->enc_pending) {
+		evbuffer_free(client->enc_pending);
+		client->enc_pending = NULL;
 	}
 
 	/* Free data tail */

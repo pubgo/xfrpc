@@ -566,6 +566,13 @@ void tcp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
 	if (client->use_encryption || client->use_compression) {
 		struct evbuffer *processed = evbuffer_new();
 		if (!processed) return;
+
+		/* First drain any encrypted leftover from a previous window
+		 * exhaustion; it must not go through crypto_encode_evbuffer()
+		 * again or the stream would be doubly encrypted. */
+		if (client->enc_pending && evbuffer_get_length(client->enc_pending) > 0)
+			evbuffer_add_buffer(processed, client->enc_pending);
+
 		crypto_encode_evbuffer(client, src, processed);
 
 		if (!c_conf->tcp_mux) {
@@ -586,10 +593,17 @@ void tcp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
 				return;
 			}
 			if (written == 0) {
-				/* Window exhausted - put remaining back */
-				struct evbuffer *input = bufferevent_get_input(bev);
-				evbuffer_prepend(input, evbuffer_pullup(processed, -1),
-				                 evbuffer_get_length(processed));
+				/* Window exhausted - stash the ENCRYPTED remainder
+				 * aside; it will be flushed first on the next
+				 * callback instead of being re-encrypted. */
+				if (!client->enc_pending)
+					client->enc_pending = evbuffer_new();
+				if (client->enc_pending) {
+					evbuffer_add_buffer(client->enc_pending, processed);
+				} else {
+					debug(LOG_ERR, "Stream %u: failed to stash encrypted data, dropping %d bytes",
+					      client->stream.id, evbuffer_get_length(processed));
+				}
 				evbuffer_free(processed);
 				bufferevent_disable(bev, EV_READ);
 				return;

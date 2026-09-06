@@ -149,7 +149,12 @@ struct frp_coder *new_coder(const char *token, const char *salt)
 	}
 
 	encrypt_key(enc->token, strlen(enc->token), enc->salt, enc->key, block_size);
-	encrypt_iv(enc->iv, block_size);
+	if (!encrypt_iv(enc->iv, block_size)) {
+		/* never proceed with a deterministic all-zero IV */
+		debug(LOG_ERR, "Failed to generate random IV");
+		free_frp_coder(enc);
+		return NULL;
+	}
 	return enc;
 }
 
@@ -199,6 +204,17 @@ struct frp_coder *init_main_encoder()
 	}
 	if (main_decoder) {
 		main_encoder = clone_coder(main_decoder);
+		if (main_encoder) {
+			/* The cloned decoder already carries the server's IV.
+			 * Reusing it for our direction would be a CFB key+IV
+			 * reuse (two-time pad), so generate a fresh IV here;
+			 * it is transmitted to the server on the first write. */
+			if (!encrypt_iv(main_encoder->iv, get_block_size())) {
+				debug(LOG_ERR, "Failed to generate encoder IV");
+				free_frp_coder(main_encoder);
+				main_encoder = NULL;
+			}
+		}
 	} else {
 		struct common_conf *c_conf = get_common_config();
 		main_encoder = new_coder(c_conf->auth_token, default_salt);

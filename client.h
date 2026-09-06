@@ -83,6 +83,10 @@ struct proxy_client {
 	unsigned char       *data_tail;
 	size_t              data_tail_size;
 
+	/* Encrypted-but-unsent data when the mux window is exhausted; kept
+	 * separately so it is never re-encrypted on the next read callback */
+	struct evbuffer    *enc_pending;
+
 	/* Per-client receive buffers (replace rx_ring for protocol parsing) */
 	uint8_t            *socks5_buf;     /* SOCKS5 parser staging buffer */
 	size_t              socks5_buf_len;

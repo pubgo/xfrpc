@@ -2250,7 +2250,28 @@ void send_enc_msg_frp_server(struct bufferevent *bev,
 		evbuffer_add(tmp, enc_msg, enc_len);
 		evutil_socket_t fd = bufferevent_getfd(bout);
 		if (fd >= 0) {
-			evbuffer_write(tmp, fd);
+			/* Drain fully: a partial write here would desynchronize
+			 * the server-side CFB keystream permanently. */
+			size_t expect = evbuffer_get_length(tmp);
+			int tries = 100;
+			while (evbuffer_get_length(tmp) > 0 && tries-- > 0) {
+				int w = evbuffer_write(tmp, fd);
+				if (w < 0) {
+					if (errno == EAGAIN || errno == EWOULDBLOCK) {
+						struct timespec ts = {0, 10 * 1000 * 1000};
+						nanosleep(&ts, NULL);
+						continue;
+					}
+					debug(LOG_ERR, "Failed to write encrypted message: %s",
+					      strerror(errno));
+					break;
+				}
+				if (w == 0)
+					break;
+			}
+			if (evbuffer_get_length(tmp) > 0)
+				debug(LOG_ERR, "Encrypted message truncated: wrote %zu of %zu bytes",
+				      expect - evbuffer_get_length(tmp), expect);
 		}
 		evbuffer_free(tmp);
 	}

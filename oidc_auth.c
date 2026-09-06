@@ -301,13 +301,20 @@ char *oidc_fetch_token(const char *token_endpoint_url,
 		}
 		if (insecure_skip_verify) {
 			SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
-		} else if (trusted_ca_file) {
-			SSL_CTX_load_verify_locations(ssl_ctx, trusted_ca_file, NULL);
+		} else {
+			/* never leave verification off implicitly: fall back to
+			 * the system CA store, and always check the hostname */
+			if (trusted_ca_file)
+				SSL_CTX_load_verify_locations(ssl_ctx, trusted_ca_file, NULL);
+			else
+				SSL_CTX_set_default_verify_paths(ssl_ctx);
 			SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
 		}
 		ssl = SSL_new(ssl_ctx);
 		SSL_set_fd(ssl, fd);
 		SSL_set_tlsext_host_name(ssl, url.host);
+		if (!insecure_skip_verify)
+			SSL_set1_host(ssl, url.host);
 		if (SSL_connect(ssl) != 1) {
 			debug(LOG_ERR, "OIDC: TLS handshake failed");
 			SSL_free(ssl);

@@ -208,6 +208,15 @@ static void tunnel_event_cb(struct bufferevent *bev, short what, void *ctx)
 	if (what & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
 		debug(LOG_DEBUG, "Visitor [%s]: tunnel side closed",
 			sess->conf->visitor_name);
+		if (sess->client) {
+			struct proxy_client *pc = sess->client;
+			if (pc->ctl_bev == sess->frps_bev)
+				pc->ctl_bev = NULL;
+			pc->visitor_ctx = NULL; /* prevent double free via free_proxy_client */
+			pc->local_proxy_bev = NULL; /* user_bev freed by visitor_session_free */
+			del_proxy_client_by_stream_id(pc->stream_id);
+			sess->client = NULL;
+		}
 		visitor_session_free(sess);
 	}
 }
@@ -487,7 +496,11 @@ static void visitor_accept_cb(struct evconnlistener *listener,
 		if (!sign_key) {
 			debug(LOG_ERR, "Visitor [%s]: failed to generate sign_key",
 				vi->conf->visitor_name);
-			free(client);
+			/* client is already linked into the global hash: a bare
+			 * free() would leave a dangling node behind */
+			client->visitor_ctx = NULL; /* keep free_proxy_client off sess */
+			sess->client = NULL;
+			del_proxy_client_by_stream_id(client->stream_id);
 			visitor_session_free(sess);
 			return;
 		}
