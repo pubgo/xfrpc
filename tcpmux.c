@@ -616,6 +616,41 @@ int process_data(struct bufferevent *bev, struct tmux_stream *stream,
         bytes_processed = length;
         debug(LOG_DEBUG, "Stream %u: leaving socks5 path processed=%u",
               stream_id, length);
+    } else if (is_udp_proxy(pc->ps)) {
+        /* UDP workConn carries TypeUDPPacket frames, not raw datagrams */
+        uint8_t *data = calloc(length + 1, sizeof(uint8_t));
+        if (!data) {
+            debug(LOG_ERR, "Memory allocation failed for UDP mux payload");
+            return 0;
+        }
+        size_t nr = bufferevent_read(bev, data, length);
+        if (nr != length) {
+            debug(LOG_ERR, "Stream %u: short read %zu/%u on UDP path",
+                  stream_id, nr, length);
+            free(data);
+            return 0;
+        }
+        handle_fn(data, length, pc);
+        free(data);
+        bytes_processed = length;
+    } else if (pc->use_encryption || pc->use_compression) {
+        /* Mux fast-path must decrypt/decompress before handing bytes to local */
+        struct evbuffer *src = bufferevent_get_input(bev);
+        struct evbuffer *frame = evbuffer_new();
+        struct evbuffer *plain = evbuffer_new();
+        if (!frame || !plain) {
+            if (frame) evbuffer_free(frame);
+            if (plain) evbuffer_free(plain);
+            debug(LOG_ERR, "Stream %u: failed to allocate crypto buffers", stream_id);
+            return 0;
+        }
+        evbuffer_remove_buffer(src, frame, length);
+        proxy_crypto_decode_evbuffer(pc, frame, plain);
+        struct evbuffer *dst = bufferevent_get_output(pc->local_proxy_bev);
+        evbuffer_add_buffer(dst, plain);
+        evbuffer_free(frame);
+        evbuffer_free(plain);
+        bytes_processed = length;
     } else {
         /* Ordinary local forwarding: zero-copy from control bev to local proxy bev */
         debug(LOG_DEBUG, "Stream %u: entering local proxy path length=%u local_proxy_bev=%p",

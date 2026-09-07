@@ -5,6 +5,13 @@
  */
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <event2/bufferevent.h>
+#include <event2/buffer.h>
+#include <event2/util.h>
 
 #include "debug.h"
 #include "uthash.h"
@@ -243,10 +250,33 @@ void handle_udp_packet(struct udp_packet *udp_pkt, struct proxy_client *client) 
         goto cleanup;
     }
 
-    // Forward decoded data
-    struct evbuffer *dst = bufferevent_get_output(client->local_proxy_bev);
-    if (evbuffer_add_buffer(dst, decoded_output) != 0) {
-        debug(LOG_ERR, "Failed to forward decoded data");
+    /* Remember peer addresses so replies can be sent back through frps */
+    if (udp_pkt->raddr && udp_pkt->raddr->addr) {
+        SAFE_FREE(client->udp_raddr);
+        client->udp_raddr = strdup(udp_pkt->raddr->addr);
+        client->udp_rport = udp_pkt->raddr->port;
+        SAFE_FREE(client->udp_rzone);
+        client->udp_rzone = udp_pkt->raddr->zone ? strdup(udp_pkt->raddr->zone) : NULL;
+    }
+    if (udp_pkt->laddr && udp_pkt->laddr->addr) {
+        SAFE_FREE(client->udp_laddr);
+        client->udp_laddr = strdup(udp_pkt->laddr->addr);
+        client->udp_lport = udp_pkt->laddr->port;
+        SAFE_FREE(client->udp_lzone);
+        client->udp_lzone = udp_pkt->laddr->zone ? strdup(udp_pkt->laddr->zone) : NULL;
+    }
+
+    /* Send datagram to the connected local UDP service */
+    size_t out_len = evbuffer_get_length(decoded_output);
+    if (out_len > 0) {
+        evutil_socket_t fd = bufferevent_getfd(client->local_proxy_bev);
+        unsigned char *payload = evbuffer_pullup(decoded_output, out_len);
+        if (fd >= 0 && payload) {
+            ssize_t n = send(fd, payload, out_len, 0);
+            if (n < 0) {
+                debug(LOG_ERR, "UDP send to local failed: %s", strerror(errno));
+            }
+        }
     }
 
 cleanup:
@@ -306,10 +336,27 @@ void udp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
         goto cleanup;
     }
 
+    /* json-c needs a C string; base64 output is not NUL-terminated */
+    evbuffer_add(base64_output, "", 1);
     udp_pkt->content = (char *)evbuffer_pullup(base64_output, -1);
     udp_pkt->raddr = raddr;
-    raddr->addr = client->ps->local_ip;
-    raddr->port = client->ps->local_port;
+    if (client->udp_raddr) {
+        raddr->addr = client->udp_raddr;
+        raddr->port = client->udp_rport;
+        raddr->zone = client->udp_rzone;
+    } else {
+        raddr->addr = client->ps->local_ip;
+        raddr->port = client->ps->local_port;
+    }
+    if (client->udp_laddr) {
+        struct udp_addr *laddr = calloc(1, sizeof(struct udp_addr));
+        if (laddr) {
+            laddr->addr = client->udp_laddr;
+            laddr->port = client->udp_lport;
+            laddr->zone = client->udp_lzone;
+            udp_pkt->laddr = laddr;
+        }
+    }
 
     // Marshal UDP packet to JSON
     if (new_udp_packet_marshal(udp_pkt, &json_buf) < 0 || !json_buf) {
@@ -318,41 +365,16 @@ void udp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
     }
 
     size_t json_len = strlen(json_buf);
-    struct common_conf *c_conf = get_common_config();
-
-    // Send data based on TCP multiplexing configuration
-    if (!c_conf->tcp_mux) {
-        struct evbuffer *dst = bufferevent_get_output(client->ctl_bev);
-        if (evbuffer_add(dst, json_buf, json_len) < 0) {
-            debug(LOG_ERR, "Failed to add data to output buffer");
-        } else {
-            bufferevent_flush(client->ctl_bev, EV_WRITE, BEV_FLUSH);
-        }
-    } else {
-        struct evbuffer *tmp = evbuffer_new();
-        if (tmp) {
-            evbuffer_add(tmp, json_buf, json_len);
-            int written = tmux_stream_write(client->ctl_bev, tmp, &client->stream);
-            evbuffer_free(tmp);
-            
-            if (written > 0) {
-                bufferevent_flush(client->ctl_bev, EV_WRITE, BEV_FLUSH);
-            }
-
-            if (written < 0) {
-                debug(LOG_ERR, "Stream %d: tmux_stream_write failed (%d) for UDP data",
-                      client->stream.id, written);
-            } else if ((size_t)written < json_len) {
-                debug(LOG_DEBUG, "Partial write on stream %d: %d/%zu bytes", 
-                      client->stream.id, written, json_len);
-                bufferevent_disable(bev, EV_READ);
-            }
-        }
-    }
+    send_msg_frp_server(client->ctl_bev, TypeUDPPacket, json_buf, json_len,
+                        &client->stream);
 
 cleanup:
     free(json_buf);
+    /* raddr/laddr point into client-owned strings; only free the shells */
+    free(udp_pkt->laddr);
+    udp_pkt->laddr = NULL;
     free(raddr);
+    udp_pkt->raddr = NULL;
     free(udp_pkt);
     evbuffer_free(base64_output);
 }

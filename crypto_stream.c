@@ -5,7 +5,9 @@
  * Stream encryption (AES-128-CFB) and compression (Snappy) for proxy data.
  *
  * Encryption: AES-128-CFB stream cipher (compatible with frp use_encryption)
- *   Key derivation: PBKDF2(token, salt="crypto", iter=64, keylen=16, SHA1)
+ *   Key derivation: PBKDF2(token, salt="frp", iter=64, keylen=16, SHA1)
+ *   golib default salt is "crypto", but frps/frpc init() set
+ *   crypto.DefaultSalt = "frp". Proxy data streams must use "frp".
  *   IV: 16 random bytes, prepended to first write
  *
  * Compression: Google Snappy (compatible with frp use_compression)
@@ -26,7 +28,7 @@
 
 #define AES_BLOCK_SIZE 16
 #define PBKDF2_ITERATIONS 64
-#define PBKDF2_SALT "crypto"
+#define PBKDF2_SALT "frp"
 
 /* ---- Encryption context ---- */
 
@@ -44,7 +46,7 @@ int crypto_derive_key(const char *token, uint8_t *out_key)
 	if (!token || !out_key)
 		return -1;
 
-	/* PBKDF2(token, salt="crypto", iter=64, keylen=16, SHA1) */
+	/* PBKDF2(token, salt="frp", iter=64, keylen=16, SHA1) */
 	if (PKCS5_PBKDF2_HMAC(token, strlen(token),
 	                       (const unsigned char *)PBKDF2_SALT, strlen(PBKDF2_SALT),
 	                       PBKDF2_ITERATIONS, EVP_sha1(),

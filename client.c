@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <sys/un.h>
 #include <syslog.h>
 #include <zlib.h>
@@ -161,6 +162,13 @@ void xfrp_proxy_event_cb(struct bufferevent *bev, short what, void *ctx) {
 	}
 
 	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
+		/* UDP sockets are connectionless: libevent often reports
+		 * BEV_EVENT_ERROR on them. Closing the workConn on that
+		 * signal makes frps see EOF after the first datagram. */
+		if (is_udp_proxy(client->ps)) {
+			debug(LOG_DEBUG, "Ignoring UDP local bev event 0x%x", what);
+			return;
+		}
 		const char *error_msg;
 		if (is_socks5_proxy(client->ps)) {
 			error_msg = "socks5 proxy";
@@ -174,7 +182,7 @@ void xfrp_proxy_event_cb(struct bufferevent *bev, short what, void *ctx) {
 		 * interactive protocols (SOCKS5, SSH, RDP) and small-packet
 		 * HTTP traffic.  Nagle's algorithm adds up to 40ms delay. */
 		int fd = bufferevent_getfd(bev);
-		if (fd >= 0) {
+		if (fd >= 0 && !is_udp_proxy(client->ps)) {
 			int one = 1;
 			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 		}
@@ -326,6 +334,21 @@ static int setup_local_connection(struct proxy_client *client)
 	
 	if (is_udp_proxy(ps)) {
 		client->local_proxy_bev = connect_udp_server(client->base);
+		if (client->local_proxy_bev && ps->local_ip && ps->local_port > 0) {
+			struct sockaddr_in addr;
+			memset(&addr, 0, sizeof(addr));
+			addr.sin_family = AF_INET;
+			addr.sin_port = htons((uint16_t)ps->local_port);
+			if (inet_pton(AF_INET, ps->local_ip, &addr.sin_addr) == 1) {
+				evutil_socket_t fd = bufferevent_getfd(client->local_proxy_bev);
+				if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+					debug(LOG_ERR, "UDP connect to %s:%d failed: %s",
+					      ps->local_ip, ps->local_port, strerror(errno));
+				}
+			} else {
+				debug(LOG_ERR, "Invalid UDP local IP: %s", ps->local_ip);
+			}
+		}
 	} else if (is_uds_proxy(ps)) {
 		client->local_proxy_bev = connect_unix_server(client->base, ps->plugin_unix_path);
 	} else if (!is_socks5_proxy(ps) && !has_service_type(ps)) {
@@ -374,7 +397,7 @@ void start_xfrp_tunnel(struct proxy_client *client)
 		}
 	}
 	if (client->use_compression) {
-		debug(LOG_INFO, "Proxy [%s] compression enabled (zlib)", ps->proxy_name);
+		debug(LOG_INFO, "Proxy [%s] compression enabled (snappy)", ps->proxy_name);
 	}
 
 	if (setup_local_connection(client) <= 0) {
@@ -421,9 +444,29 @@ int send_client_data_tail(struct proxy_client *client)
 		return -1;
 	}
 
-	int bytes_written = bufferevent_write(client->local_proxy_bev,
-										client->data_tail,
-										client->data_tail_size);
+	int bytes_written = 0;
+	if (client->use_encryption || client->use_compression) {
+		struct evbuffer *src = evbuffer_new();
+		struct evbuffer *plain = evbuffer_new();
+		if (!src || !plain) {
+			if (src) evbuffer_free(src);
+			if (plain) evbuffer_free(plain);
+			free(client->data_tail);
+			client->data_tail = NULL;
+			client->data_tail_size = 0;
+			return -1;
+		}
+		evbuffer_add(src, client->data_tail, client->data_tail_size);
+		proxy_crypto_decode_evbuffer(client, src, plain);
+		bytes_written = (int)evbuffer_get_length(plain);
+		evbuffer_add_buffer(bufferevent_get_output(client->local_proxy_bev), plain);
+		evbuffer_free(src);
+		evbuffer_free(plain);
+	} else {
+		bytes_written = bufferevent_write(client->local_proxy_bev,
+						client->data_tail,
+						client->data_tail_size);
+	}
 
 	free(client->data_tail);
 	client->data_tail = NULL;
@@ -481,6 +524,11 @@ free_proxy_client(struct proxy_client *client)
 		free(client->xdpi_buf);
 		client->xdpi_buf = NULL;
 	}
+
+	SAFE_FREE(client->udp_laddr);
+	SAFE_FREE(client->udp_lzone);
+	SAFE_FREE(client->udp_raddr);
+	SAFE_FREE(client->udp_rzone);
 
 	/* Free encryption contexts */
 	if (client->encrypt_ctx) {

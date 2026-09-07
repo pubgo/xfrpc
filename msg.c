@@ -991,16 +991,16 @@ static struct udp_addr *parse_udp_addr(struct json_object *j_addr) {
 
 	struct json_object *j_ip = NULL, *j_port = NULL, *j_zone = NULL;
 	if (!json_object_object_get_ex(j_addr, "IP", &j_ip) ||
-		!json_object_object_get_ex(j_addr, "Port", &j_port) ||
-		!json_object_object_get_ex(j_addr, "Zone", &j_zone)) {
+		!json_object_object_get_ex(j_addr, "Port", &j_port)) {
 		return NULL;
 	}
+	json_object_object_get_ex(j_addr, "Zone", &j_zone);
 
 	struct udp_addr *addr = calloc(1, sizeof(struct udp_addr));
 	if (!addr) return NULL;
 
 	addr->addr = strdup(json_object_get_string(j_ip));
-	addr->zone = strdup(json_object_get_string(j_zone));
+	addr->zone = strdup(j_zone ? json_object_get_string(j_zone) : "");
 	addr->port = json_object_get_int(j_port);
 
 	if (!addr->addr || !addr->zone) {
@@ -1039,21 +1039,13 @@ struct udp_packet *udp_packet_unmarshal(const char *msg) {
 	udp->content = strdup(json_object_get_string(j_content));
 	if (!udp->content) goto error;
 
-	// Parse local address
 	struct json_object *j_laddr = NULL;
-	if (!json_object_object_get_ex(j_udp, "l", &j_laddr)) {
-		goto error;
-	}
-	udp->laddr = parse_udp_addr(j_laddr);
-	if (!udp->laddr) goto error;
+	if (json_object_object_get_ex(j_udp, "l", &j_laddr))
+		udp->laddr = parse_udp_addr(j_laddr);
 
-	// Parse remote address
 	struct json_object *j_raddr = NULL;
-	if (!json_object_object_get_ex(j_udp, "r", &j_raddr)) {
-		goto error;
-	}
-	udp->raddr = parse_udp_addr(j_raddr);
-	if (!udp->raddr) goto error;
+	if (json_object_object_get_ex(j_udp, "r", &j_raddr))
+		udp->raddr = parse_udp_addr(j_raddr);
 
 	json_object_put(j_udp);
 	return udp;

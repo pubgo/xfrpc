@@ -104,6 +104,14 @@ struct proxy_client {
 	int                 use_compression;
 	struct crypto_ctx   *encrypt_ctx;   /* AES-128-CFB writer context */
 	struct crypto_ctx   *decrypt_ctx;   /* AES-128-CFB reader context */
+
+	/* Last UDP peer addresses from TypeUDPPacket (needed for replies) */
+	char                *udp_laddr;
+	int                  udp_lport;
+	char                *udp_lzone;
+	char                *udp_raddr;
+	int                  udp_rport;
+	char                *udp_rzone;
 };
 
 struct proxy_service {

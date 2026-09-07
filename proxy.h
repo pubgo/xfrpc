@@ -33,6 +33,8 @@ void free_proxy_obj(struct proxy *p);
 // TCP proxy callbacks
 void tcp_proxy_c2s_cb(struct bufferevent *bev, void *ctx);
 void tcp_proxy_s2c_cb(struct bufferevent *bev, void *ctx);
+void proxy_crypto_decode_evbuffer(struct proxy_client *client,
+				  struct evbuffer *src, struct evbuffer *dst);
 
 // UDP proxy callbacks
 void udp_proxy_c2s_cb(struct bufferevent *bev, void *ctx);

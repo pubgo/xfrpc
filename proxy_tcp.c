@@ -462,7 +462,7 @@ static void crypto_encode_evbuffer(struct proxy_client *client,
 
 	/* Use compressed data if available, otherwise raw */
 	uint8_t *work_data = comp_data ? comp_data : data;
-	size_t work_len = comp_data ? comp_data ? comp_len : len : len;
+	size_t work_len = comp_data ? comp_len : len;
 
 	/* Encryption: encrypt in-place, prepend IV on first call */
 	if (client->use_encryption && client->encrypt_ctx) {
@@ -492,7 +492,7 @@ static void crypto_encode_evbuffer(struct proxy_client *client,
  * @param src Source evbuffer (encrypted/compressed data)
  * @param dst Destination evbuffer (raw data)
  */
-static void crypto_decode_evbuffer(struct proxy_client *client,
+void proxy_crypto_decode_evbuffer(struct proxy_client *client,
                                    struct evbuffer *src, struct evbuffer *dst)
 {
 	size_t len = evbuffer_get_length(src);
@@ -662,7 +662,7 @@ void tcp_proxy_s2c_cb(struct bufferevent *bev, void *ctx)
 	if (client->use_encryption || client->use_compression) {
 		struct evbuffer *processed = evbuffer_new();
 		if (!processed) return;
-		crypto_decode_evbuffer(client, src, processed);
+		proxy_crypto_decode_evbuffer(client, src, processed);
 
 		struct evbuffer *dst = bufferevent_get_output(client->local_proxy_bev);
 		evbuffer_add_buffer(dst, processed);
