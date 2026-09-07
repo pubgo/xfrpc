@@ -7,6 +7,7 @@
 #define XFRPC_TCPMUX_H
 
 #include "uthash.h"
+#include <stddef.h>
 #include <stdint.h>
 
 #define MAX_STREAM_WINDOW_SIZE (8 * 1024 * 1024)  // 8MB to match frps server
@@ -68,7 +69,11 @@ struct tmux_stream {
     uint32_t recv_window;
     uint32_t send_window;
     enum tcp_mux_state state;
-    // private arguments
+    int v2_magic_sent;
+    int v2_magic_seen;
+    uint8_t *v2_rx;
+    size_t v2_rx_len;
+    size_t v2_rx_cap;
     UT_hash_handle hh;
 };
 

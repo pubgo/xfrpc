@@ -135,6 +135,8 @@ set(CORE_SOURCES
     commandline.c
     crypto.c
     utils.c
+    wire_v2.c
+    aead_stream.c
     common.c
     login.c
     tls.c

@@ -54,6 +54,9 @@ struct common_conf {
 	/* Transport protocol: "tcp" (default), "quic" */
 	char    *protocol;
 
+	/* Wire protocol: "v1" (default) or "v2" (frp >= 0.69) */
+	char    *wire_protocol;
+
 	/* QUIC settings */
 	int     quic_bind_port;       /* frps QUIC port, default 0 (disabled) */
 

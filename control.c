@@ -38,12 +38,21 @@
 #include "commandline.h"
 #include "health_check.h"
 #include "quic_client_transport.h"
+#include "wire_v2.h"
+#include "aead_stream.h"
 
 static struct control *main_ctl;
 static bool xfrpc_status;
 static int is_login;
 static time_t pong_time;
 static volatile int g_reconnect_requested;
+
+static uint8_t *v2_ch_json;
+static size_t v2_ch_json_len;
+static int v2_got_hello;
+static int v2_aead_ready;
+static struct aead_writer v2_aw;
+static struct aead_reader v2_ar;
 
 static void new_work_connection(struct bufferevent *bev, struct tmux_stream *stream);
 static void recv_cb(struct bufferevent *bev, void *ctx);
@@ -56,6 +65,9 @@ static void start_proxy_services(void);
 static int prepare_message(const enum msg_type type, const char *msg,
 			   const size_t msg_len, struct msg_hdr **msg_out,
 			   size_t *total_len);
+static int prepare_login_message(char **msg_out, int *len_out);
+static void handle_control_work(const uint8_t *buf, int len, void *ctx);
+static int handle_login_response(const uint8_t *buf, int len);
 static void health_check_result_cb(struct proxy_service *ps, int healthy, void *ctx);
 static void reconnect_timer_cb(evutil_socket_t fd, short what, void *ctx);
 
@@ -1123,7 +1135,7 @@ static void handle_control_work(const uint8_t *buf, int len, void *ctx)
 	uint8_t *frps_cmd = NULL;
 	int flen = 0;
 
-	if (!ctx) {
+	if (!ctx && !wire_protocol_is_v2()) {
 		int dlen = handle_enc_msg(buf, len, &frps_cmd);
 		if (dlen <= 0 || !frps_cmd) {
 			return;
@@ -1309,23 +1321,176 @@ static int handle_login_response(const uint8_t *buf, int len)
  * @details This function processes incoming messages from the frps (frp server)
  *          and performs appropriate handling based on the message content
  */
+static int v2_buf_append(uint8_t **buf, size_t *len, size_t *cap,
+			 const uint8_t *p, size_t n)
+{
+	if (*len + n > *cap) {
+		size_t capn = *cap ? *cap * 2 : 4096;
+		while (capn < *len + n)
+			capn *= 2;
+		uint8_t *nb = realloc(*buf, capn);
+		if (!nb)
+			return -1;
+		*buf = nb;
+		*cap = capn;
+	}
+	memcpy(*buf + *len, p, n);
+	*len += n;
+	return 0;
+}
+
+static int v2_init_aead_from_hello(const uint8_t *sh_json, size_t sh_len)
+{
+	char alg[64] = {0};
+	char err[256] = {0};
+	if (wire_v2_parse_server_hello_json(sh_json, sh_len, alg, sizeof(alg),
+					    err, sizeof(err)) != 0) {
+		debug(LOG_ERR, "v2 ServerHello rejected: %s", err[0] ? err : "parse error");
+		return -1;
+	}
+	uint8_t transcript[32];
+	wire_v2_hash_transcript(v2_ch_json, v2_ch_json_len, sh_json, sh_len, transcript);
+
+	struct common_conf *c = get_common_config();
+	const char *token = c->auth_token ? c->auth_token : "";
+	uint8_t c2s[AEAD_KEY_SIZE], s2c[AEAD_KEY_SIZE];
+	if (derive_v2_control_keys((const uint8_t *)token, strlen(token),
+				   transcript, alg, c2s, s2c) != 0)
+		return -1;
+	if (aead_writer_init(&v2_aw, c2s) != 0)
+		return -1;
+	if (aead_reader_init(&v2_ar, s2c) != 0)
+		return -1;
+	v2_got_hello = 1;
+	debug(LOG_INFO, "Wire v2 ServerHello ok, AEAD %s", alg);
+	return 0;
+}
+
+static void v2_dispatch_v1_buf(uint8_t *v1, size_t v1_len, void *ctx)
+{
+	if (!is_login) {
+		handle_login_response(v1, (int)v1_len);
+		free(v1);
+	} else {
+		handle_control_work(v1, (int)v1_len, ctx);
+		if (ctx)
+			free(v1);
+	}
+}
+
+static void v2_consume_plain_frames(struct tmux_stream *st, void *ctx)
+{
+	while (st->v2_rx_len >= 8) {
+		uint16_t type = 0;
+		const uint8_t *pl = NULL;
+		uint32_t plen = 0;
+		int n = wire_v2_parse_frame(st->v2_rx, st->v2_rx_len, &type, &pl, &plen);
+		if (n == 0)
+			return;
+		if (n < 0) {
+			st->v2_rx_len = 0;
+			return;
+		}
+		if (!v2_got_hello && !ctx) {
+			if (type != WIRE_V2_FRAME_SERVER_HELLO) {
+				debug(LOG_ERR, "v2 expected ServerHello, got type %u", type);
+				memmove(st->v2_rx, st->v2_rx + n, st->v2_rx_len - (size_t)n);
+				st->v2_rx_len -= (size_t)n;
+				return;
+			}
+			if (v2_init_aead_from_hello(pl, plen) != 0) {
+				memmove(st->v2_rx, st->v2_rx + n, st->v2_rx_len - (size_t)n);
+				st->v2_rx_len -= (size_t)n;
+				return;
+			}
+		} else if (type == WIRE_V2_FRAME_MESSAGE) {
+			uint8_t *v1 = NULL;
+			size_t v1_len = 0;
+			if (wire_v2_payload_to_v1(pl, plen, &v1, &v1_len) == 0)
+				v2_dispatch_v1_buf(v1, v1_len, ctx);
+		} else {
+			debug(LOG_ERR, "v2 unexpected frame type %u", type);
+		}
+		memmove(st->v2_rx, st->v2_rx + n, st->v2_rx_len - (size_t)n);
+		st->v2_rx_len -= (size_t)n;
+
+		if (!ctx && is_login && v2_got_hello && !v2_aead_ready) {
+			v2_aead_ready = 1;
+			if (st->v2_rx_len) {
+				if (aead_reader_feed(&v2_ar, st->v2_rx, st->v2_rx_len) == 0 &&
+				    v2_ar.pt_len > 0) {
+					size_t pt_len = v2_ar.pt_len;
+					uint8_t *pt = malloc(pt_len);
+					if (pt) {
+						memcpy(pt, v2_ar.pt_buf, pt_len);
+						v2_ar.pt_len = 0;
+						st->v2_rx_len = 0;
+						v2_buf_append(&st->v2_rx, &st->v2_rx_len, &st->v2_rx_cap,
+							      pt, pt_len);
+						free(pt);
+						v2_consume_plain_frames(st, ctx);
+						return;
+					}
+				}
+				st->v2_rx_len = 0;
+			}
+			return;
+		}
+	}
+}
+
+static void v2_handle_bytes(uint8_t *buf, int len, void *ctx)
+{
+	struct tmux_stream *st = ctx ? &((struct proxy_client *)ctx)->stream
+				     : &main_ctl->stream;
+	if (!st)
+		return;
+
+	const uint8_t *p = buf;
+	int left = len;
+	if (!st->v2_magic_seen && left >= WIRE_V2_MAGIC_LEN &&
+	    memcmp(p, WIRE_V2_MAGIC, WIRE_V2_MAGIC_LEN) == 0) {
+		p += WIRE_V2_MAGIC_LEN;
+		left -= WIRE_V2_MAGIC_LEN;
+		st->v2_magic_seen = 1;
+	}
+
+	if (v2_aead_ready && !ctx) {
+		if (aead_reader_feed(&v2_ar, p, (size_t)left) != 0)
+			return;
+		if (v2_ar.pt_len) {
+			if (v2_buf_append(&st->v2_rx, &st->v2_rx_len, &st->v2_rx_cap,
+					  v2_ar.pt_buf, v2_ar.pt_len) != 0)
+				return;
+			v2_ar.pt_len = 0;
+			v2_consume_plain_frames(st, ctx);
+		}
+		return;
+	}
+
+	if (v2_buf_append(&st->v2_rx, &st->v2_rx_len, &st->v2_rx_cap, p, (size_t)left) != 0)
+		return;
+	v2_consume_plain_frames(st, ctx);
+}
+
 static void handle_frps_msg(uint8_t *buf, int len, void *ctx) 
 {
-	// Validate input parameters
 	if (!buf || len <= 0) {
 		debug(LOG_ERR, "Invalid message buffer or length");
 		return;
 	}
 
-	// Handle message based on login state
+	if (wire_protocol_is_v2()) {
+		v2_handle_bytes(buf, len, ctx);
+		return;
+	}
+
 	if (!is_login) {
-		// Handle login response first
 		if (!handle_login_response(buf, len)) {
 			debug(LOG_ERR, "Login response handling failed");
 			return;
 		}
 	} else {
-		// Handle control messages after successful login
 		handle_control_work(buf, len, ctx);
 	}
 }
@@ -1983,20 +2148,119 @@ static int prepare_login_message(char **msg_out, int *len_out) {
  *
  * @note This function does not take any parameters and does not return a value
  */
+static int v2_write_bytes(struct bufferevent *bev, struct tmux_stream *stream,
+			  const uint8_t *data, size_t len)
+{
+	struct common_conf *c_conf = get_common_config();
+	if (!bev)
+		bev = main_ctl->connect_bev;
+	if (!bev || !data || !len)
+		return -1;
+	if (c_conf->tcp_mux && stream) {
+		struct evbuffer *tmp = evbuffer_new();
+		if (!tmp)
+			return -1;
+		evbuffer_add(tmp, data, len);
+		int w = tmux_stream_write(bev, tmp, stream);
+		evbuffer_free(tmp);
+		bufferevent_flush(bev, EV_WRITE, BEV_FLUSH);
+		return w < 0 ? -1 : 0;
+	}
+	if (bufferevent_write(bev, data, len) < 0)
+		return -1;
+	bufferevent_flush(bev, EV_WRITE, BEV_FLUSH);
+	return 0;
+}
+
+static void v2_session_reset(void)
+{
+	SAFE_FREE(v2_ch_json);
+	v2_ch_json_len = 0;
+	v2_got_hello = 0;
+	v2_aead_ready = 0;
+	aead_writer_free(&v2_aw);
+	aead_reader_free(&v2_ar);
+}
+
+static int v2_send_login_handshake(void)
+{
+	struct common_conf *c_conf = get_common_config();
+	struct bufferevent *bev = main_ctl->connect_bev;
+	struct tmux_stream *st = &main_ctl->stream;
+	const char *proto = c_conf->protocol ? c_conf->protocol : "tcp";
+
+	uint8_t *hello_json = NULL;
+	size_t hj = 0;
+	if (wire_v2_build_client_hello_json(proto, c_conf->tls_enable,
+					    c_conf->tcp_mux, &hello_json, &hj) != 0) {
+		debug(LOG_ERR, "Failed to build v2 ClientHello");
+		return -1;
+	}
+	uint8_t *hello_frame = NULL;
+	size_t hf = 0;
+	if (wire_v2_encode_frame(WIRE_V2_FRAME_CLIENT_HELLO, hello_json,
+				 (uint32_t)hj, &hello_frame, &hf) != 0) {
+		free(hello_json);
+		return -1;
+	}
+	v2_ch_json = hello_json;
+	v2_ch_json_len = hj;
+
+	char *login_msg = NULL;
+	int msg_len = 0;
+	if (prepare_login_message(&login_msg, &msg_len) != 0) {
+		free(hello_frame);
+		return -1;
+	}
+	uint8_t *login_frame = NULL;
+	size_t lf = 0;
+	if (wire_v2_encode_message(TypeLogin, login_msg, (size_t)msg_len,
+				   &login_frame, &lf) != 0) {
+		SAFE_FREE(login_msg);
+		free(hello_frame);
+		return -1;
+	}
+	SAFE_FREE(login_msg);
+
+	size_t total = WIRE_V2_MAGIC_LEN + hf + lf;
+	uint8_t *blob = malloc(total);
+	if (!blob) {
+		free(hello_frame);
+		free(login_frame);
+		return -1;
+	}
+	memcpy(blob, WIRE_V2_MAGIC, WIRE_V2_MAGIC_LEN);
+	memcpy(blob + WIRE_V2_MAGIC_LEN, hello_frame, hf);
+	memcpy(blob + WIRE_V2_MAGIC_LEN + hf, login_frame, lf);
+	int rc = v2_write_bytes(bev, st, blob, total);
+	if (st)
+		st->v2_magic_sent = 1;
+	free(hello_frame);
+	free(login_frame);
+	free(blob);
+	debug(LOG_INFO, "Sent wire protocol v2 ClientHello + Login (%zu bytes)", total);
+	return rc;
+}
+
 void login(void) {
 	char *login_msg = NULL;
 	int msg_len = 0;
 
-	// Prepare login message
+	if (wire_protocol_is_v2()) {
+		if (v2_send_login_handshake() != 0) {
+			debug(LOG_ERR, "Failed to send v2 login handshake");
+			exit(1);
+		}
+		return;
+	}
+
 	if (prepare_login_message(&login_msg, &msg_len) != 0) {
 		debug(LOG_ERR, "Failed to prepare login message");
 		exit(1);
 	}
 
-	// Send login request
 	send_msg_frp_server(NULL, TypeLogin, login_msg, msg_len, &main_ctl->stream);
 
-	// Cleanup
 	SAFE_FREE(login_msg);
 }
 
@@ -2058,6 +2322,41 @@ void send_msg_frp_server(struct bufferevent *bev,
 	struct msg_hdr *req_msg = NULL;
 	size_t total_len = 0;
 	if (prepare_message(type, msg, msg_len, &req_msg, &total_len) != 0) {
+		return;
+	}
+
+	if (wire_protocol_is_v2()) {
+		uint8_t *frame = NULL;
+		size_t flen = 0;
+		if (wire_v2_encode_message(type, msg, msg_len, &frame, &flen) != 0) {
+			free(req_msg);
+			return;
+		}
+		size_t extra = 0;
+		if (stream && !stream->v2_magic_sent) {
+			extra = WIRE_V2_MAGIC_LEN;
+		}
+		uint8_t *blob = frame;
+		size_t blen = flen;
+		if (extra) {
+			blob = malloc(extra + flen);
+			if (!blob) {
+				free(frame);
+				free(req_msg);
+				return;
+			}
+			memcpy(blob, WIRE_V2_MAGIC, extra);
+			memcpy(blob + extra, frame, flen);
+			free(frame);
+			blen = extra + flen;
+			stream->v2_magic_sent = 1;
+		}
+		v2_write_bytes(bout, stream, blob, blen);
+		if (extra)
+			free(blob);
+		else
+			free(frame);
+		free(req_msg);
 		return;
 	}
 
@@ -2208,6 +2507,24 @@ void send_enc_msg_frp_server(struct bufferevent *bev,
 	struct bufferevent *bout = bev ? bev : main_ctl->connect_bev;
 	if (!bout) {
 		debug(LOG_ERR, "No valid bufferevent");
+		return;
+	}
+
+	if (wire_protocol_is_v2()) {
+		uint8_t *frame = NULL;
+		size_t flen = 0;
+		if (wire_v2_encode_message(type, msg, msg_len, &frame, &flen) != 0)
+			return;
+		uint8_t *sealed = NULL;
+		size_t slen = 0;
+		if (!v2_got_hello || aead_writer_seal(&v2_aw, frame, flen, &sealed, &slen) != 0) {
+			debug(LOG_ERR, "v2 AEAD seal failed");
+			free(frame);
+			return;
+		}
+		free(frame);
+		v2_write_bytes(bout, stream, sealed, slen);
+		free(sealed);
 		return;
 	}
 
@@ -2621,6 +2938,7 @@ static void clear_main_control()
 	set_xfrpc_status(false);
 	is_login = 0;
 	pong_time = 0;
+	v2_session_reset();
 
 	// Reset TCP mux parser state (static variables in handle_tcp_mux)
 	handle_tcp_mux(NULL, 0, NULL);

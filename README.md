@@ -10,24 +10,29 @@ The xfrpc project is an implementation of frp client written in C language for O
 
 xfrpc partially compitable with latest frp release feature, It targets to fully compatible with latest frp release.
 
-the following table is detail  compatible feature:
+the following table is detail  compatible feature (vs official frpc / frp v0.71):
 
-| Feature  | xfrpc | frpc |
+| Feature | xfrpc | frpc |
 | ------------- | ------------- | ---------|
-| tcp  | Yes |	 Yes  |
-| tcpmux  | Yes |	 Yes  |
-| http  | Yes |	 Yes  |
-| https  | Yes |  Yes  |
+| tcp | Yes | Yes |
+| tcpmux | Yes | Yes |
+| http | Yes | Yes |
+| https | Yes | Yes |
 | custom_domains | Yes | Yes |
 | subdomain | Yes | Yes |
-| socks5 | Yes | No |
-| use_encryption | No | Yes |
-| use_compression | No | Yes |
-| udp  | Yes |  Yes  |
-| p2p  | No |  Yes  |
-| xtcp  | Yes |  Yes  |
-| stcp  | Yes |  Yes  |
-| quic transport  | Yes |  Yes  |
+| socks5 (proxy type) | Yes | plugin only |
+| use_encryption | Yes | Yes |
+| use_compression | Yes | Yes |
+| udp | Yes | Yes |
+| xtcp (P2P) | Yes | Yes |
+| stcp | Yes | Yes |
+| quic transport | Yes | Yes |
+| `transport.wireProtocol = v1` | Yes (default) | Yes |
+| `transport.wireProtocol = v2` | Yes (JSON messages + AES-256-GCM control AEAD) | Yes |
+| kcp / websocket / wss | No | Yes |
+| SUDP | Partial (config only) | Yes |
+| VirtualNet | No | Yes |
+| official plugins (http_proxy, static_file, tls2raw, …) | No | Yes |
 
 
 

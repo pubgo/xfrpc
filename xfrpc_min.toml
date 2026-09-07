@@ -1,6 +1,7 @@
 # xfrpc minimal TOML configuration example
 serverAddr = "0.0.0.0"
 serverPort = 7000
+# transport.wireProtocol = "v2"   # requires frps >= 0.69; default is v1
 
 auth.method = "token"
 auth.token = "12345678"

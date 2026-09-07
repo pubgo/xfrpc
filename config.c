@@ -77,6 +77,7 @@ void free_common_config(void)
 	SAFE_FREE(c_conf->tls_server_name);
 	SAFE_FREE(c_conf->user);
 	SAFE_FREE(c_conf->protocol);
+	SAFE_FREE(c_conf->wire_protocol);
 }
 
 /**
@@ -768,6 +769,10 @@ static int common_handler(void *user, const char *section, const char *name, con
 		SAFE_FREE(config->protocol);
 		config->protocol = strdup(value);
 	}
+	else if (MATCH("common", "wire_protocol")) {
+		SAFE_FREE(config->wire_protocol);
+		config->wire_protocol = strdup(value);
+	}
 	else if (MATCH("common", "quic_bind_port")) {
 		config->quic_bind_port = atoi(value);
 	}
@@ -862,6 +867,7 @@ static void init_common_conf(struct common_conf *config) {
 	config->tcp_mux = 1;
 	config->tls_enable = 0;
 	config->protocol = strdup("tcp");
+	config->wire_protocol = strdup("v1");
 	config->quic_bind_port = 0;
 	config->tls_cert_file = NULL;
 	config->tls_key_file = NULL;
@@ -995,6 +1001,14 @@ static void load_toml_common(struct toml_doc *doc)
 	if ((v = toml_get(root, "transport.protocol"))) {
 		SAFE_FREE(c_conf->protocol);
 		c_conf->protocol = strdup(v);
+	}
+	if ((v = toml_get(root, "transport.wireProtocol"))) {
+		SAFE_FREE(c_conf->wire_protocol);
+		c_conf->wire_protocol = strdup(v);
+		if (strcmp(v, "v1") != 0 && strcmp(v, "v2") != 0) {
+			debug(LOG_ERR, "TOML: transport.wireProtocol must be v1 or v2 (got %s)", v);
+			exit(1);
+		}
 	}
 	if ((v = toml_get(root, "transport.tcpMux")))
 		c_conf->tcp_mux = is_true(v);

@@ -168,6 +168,11 @@ void init_tmux_stream(struct tmux_stream *stream, uint32_t id, enum tcp_mux_stat
     stream->state = state;
     stream->recv_window = MAX_STREAM_WINDOW_SIZE;  // 8MB
     stream->send_window = 256 * 1024;  // 256KB initial (matches yamux initialStreamWindow)
+    stream->v2_magic_sent = 0;
+    stream->v2_magic_seen = 0;
+    stream->v2_rx = NULL;
+    stream->v2_rx_len = 0;
+    stream->v2_rx_cap = 0;
 
     add_stream(stream);
     debug(LOG_DEBUG, "Initialized stream %u with state %d", id, state);
@@ -177,8 +182,12 @@ void init_tmux_stream(struct tmux_stream *stream, uint32_t id, enum tcp_mux_stat
  * @brief Releases per-stream temporary resources.
  */
 void tmux_stream_release(struct tmux_stream *stream) {
-    // tx_frame_buffer已移除，无需释放
-    (void)stream;
+    if (!stream)
+        return;
+    free(stream->v2_rx);
+    stream->v2_rx = NULL;
+    stream->v2_rx_len = 0;
+    stream->v2_rx_cap = 0;
 }
 
 /**
