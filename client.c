@@ -11,7 +11,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/un.h>
 #include <syslog.h>
 #include <zlib.h>
 
@@ -21,12 +22,12 @@
 #include "uthash.h"
 #include "control.h"
 #include "config.h"
-#include "uthash.h"
 #include "zip.h"
 #include "common.h"
 #include "proxy.h"
 #include "utils.h"
 #include "tcpmux.h"
+#include "crypto_stream.h"
 
 static struct proxy_client 	*all_pc = NULL;
 
@@ -34,8 +35,11 @@ static struct proxy_client 	*all_pc = NULL;
  * @brief Event callback for worker connection events
  */
 static void xfrp_worker_event_cb(struct bufferevent *bev, short what, void *ctx) {
+	struct proxy_client *client = (struct proxy_client *)ctx;
 	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
 		debug(LOG_DEBUG, "Working connection closed");
+		if (client && client->ctl_bev == bev)
+			client->ctl_bev = NULL;
 		bufferevent_free(bev);
 	}
 }
@@ -158,6 +162,13 @@ void xfrp_proxy_event_cb(struct bufferevent *bev, short what, void *ctx) {
 	}
 
 	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
+		/* UDP sockets are connectionless: libevent often reports
+		 * BEV_EVENT_ERROR on them. Closing the workConn on that
+		 * signal makes frps see EOF after the first datagram. */
+		if (is_udp_proxy(client->ps)) {
+			debug(LOG_DEBUG, "Ignoring UDP local bev event 0x%x", what);
+			return;
+		}
 		const char *error_msg;
 		if (is_socks5_proxy(client->ps)) {
 			error_msg = "socks5 proxy";
@@ -171,7 +182,7 @@ void xfrp_proxy_event_cb(struct bufferevent *bev, short what, void *ctx) {
 		 * interactive protocols (SOCKS5, SSH, RDP) and small-packet
 		 * HTTP traffic.  Nagle's algorithm adds up to 40ms delay. */
 		int fd = bufferevent_getfd(bev);
-		if (fd >= 0) {
+		if (fd >= 0 && !is_udp_proxy(client->ps)) {
 			int one = 1;
 			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 		}
@@ -187,13 +198,6 @@ static int is_proxy_type(const struct proxy_service *ps, const char *type, int e
 		return 0;
 	}
 	return (strcmp(ps->proxy_type, type) == 0) && extra_check;
-}
-
-/**
- * @brief Check if proxy service is FTP type
- */
-int is_ftp_proxy(const struct proxy_service *ps) {
-	return is_proxy_type(ps, "ftp", ps->remote_data_port > 0);
 }
 
 /**
@@ -234,6 +238,14 @@ int is_stcp_proxy(const struct proxy_service *ps) {
 }
 
 /**
+ * Check if proxy service uses Unix Domain Socket plugin
+ */
+int is_uds_proxy(const struct proxy_service *ps) {
+	return (ps && ps->plugin && strcmp(ps->plugin, "unix_domain_socket") == 0 &&
+		ps->plugin_unix_path != NULL);
+}
+
+/**
  * Sets up callback functions for a proxy client
  */
 static void setup_proxy_callbacks(struct proxy_client *client, 
@@ -242,10 +254,7 @@ static void setup_proxy_callbacks(struct proxy_client *client,
 {
 	struct proxy_service *ps = client->ps;
 	
-	if (is_ftp_proxy(ps)) {
-		*proxy_c2s_recv = ftp_proxy_c2s_cb;
-		*proxy_s2c_recv = ftp_proxy_s2c_cb;
-	} else if (is_udp_proxy(ps)) {
+	if (is_udp_proxy(ps)) {
 		*proxy_c2s_recv = udp_proxy_c2s_cb;
 		*proxy_s2c_recv = udp_proxy_s2c_cb;
 	} else if (is_socks5_proxy(ps)) {
@@ -261,6 +270,62 @@ static void setup_proxy_callbacks(struct proxy_client *client,
 }
 
 /**
+ * @brief Connect to a local Unix Domain Socket
+ *
+ * Creates a non-blocking connection to a Unix domain socket at the given path.
+ * Returns a bufferevent connected to the socket, or NULL on failure.
+ */
+static struct bufferevent *connect_unix_server(struct event_base *base, const char *unix_path)
+{
+	if (!base || !unix_path) {
+		debug(LOG_ERR, "Invalid parameters for Unix socket connection");
+		return NULL;
+	}
+
+	/* Create Unix socket */
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		debug(LOG_ERR, "Failed to create Unix socket: %s", strerror(errno));
+		return NULL;
+	}
+
+	/* Set non-blocking */
+	evutil_make_socket_nonblocking(fd);
+
+	/* Connect to Unix socket */
+	struct sockaddr_un sun;
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	strncpy(sun.sun_path, unix_path, sizeof(sun.sun_path) - 1);
+
+	int ret = connect(fd, (struct sockaddr *)&sun, sizeof(sun));
+	if (ret < 0 && errno != EINPROGRESS) {
+		debug(LOG_ERR, "Failed to connect to Unix socket %s: %s", unix_path, strerror(errno));
+		close(fd);
+		return NULL;
+	}
+
+	/* Create bufferevent */
+	struct bufferevent *bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+	if (!bev) {
+		debug(LOG_ERR, "Failed to create bufferevent for Unix socket");
+		close(fd);
+		return NULL;
+	}
+
+	/* For non-blocking connect, the BEV_EVENT_CONNECTED callback will fire */
+	if (ret == 0) {
+		/* Connected immediately */
+		debug(LOG_DEBUG, "Connected to Unix socket: %s", unix_path);
+	} else {
+		/* EINPROGRESS — will connect asynchronously */
+		debug(LOG_DEBUG, "Connecting to Unix socket: %s", unix_path);
+	}
+
+	return bev;
+}
+
+/**
  * @brief Sets up a local connection for the proxy client
  */
 static int setup_local_connection(struct proxy_client *client) 
@@ -269,6 +334,23 @@ static int setup_local_connection(struct proxy_client *client)
 	
 	if (is_udp_proxy(ps)) {
 		client->local_proxy_bev = connect_udp_server(client->base);
+		if (client->local_proxy_bev && ps->local_ip && ps->local_port > 0) {
+			struct sockaddr_in addr;
+			memset(&addr, 0, sizeof(addr));
+			addr.sin_family = AF_INET;
+			addr.sin_port = htons((uint16_t)ps->local_port);
+			if (inet_pton(AF_INET, ps->local_ip, &addr.sin_addr) == 1) {
+				evutil_socket_t fd = bufferevent_getfd(client->local_proxy_bev);
+				if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+					debug(LOG_ERR, "UDP connect to %s:%d failed: %s",
+					      ps->local_ip, ps->local_port, strerror(errno));
+				}
+			} else {
+				debug(LOG_ERR, "Invalid UDP local IP: %s", ps->local_ip);
+			}
+		}
+	} else if (is_uds_proxy(ps)) {
+		client->local_proxy_bev = connect_unix_server(client->base, ps->plugin_unix_path);
 	} else if (!is_socks5_proxy(ps) && !has_service_type(ps)) {
 		client->local_proxy_bev = connect_server(client->base, ps->local_ip, ps->local_port);
 	} else {
@@ -290,17 +372,37 @@ static int setup_local_connection(struct proxy_client *client)
  */
 void start_xfrp_tunnel(struct proxy_client *client)
 {
-	if (!client || !client->ctl_bev || !client->base || !client->ps || !client->ps->local_port) {
+	if (!client || !client->ctl_bev || !client->base || !client->ps ||
+		    (!client->ps->local_port && !is_uds_proxy(client->ps))) {
 		debug(LOG_ERR, "Invalid client configuration");
 		return;
+	}
+
+	/* Initialize encryption/compression from proxy_service config */
+	struct common_conf *c_conf = get_common_config();
+	struct proxy_service *ps = client->ps;
+	client->use_encryption = ps->use_encryption;
+	client->use_compression = ps->use_compression;
+
+	if (client->use_encryption && c_conf->auth_token) {
+		uint8_t key[16];
+		if (crypto_derive_key(c_conf->auth_token, key) == 0) {
+			client->encrypt_ctx = crypto_ctx_new_writer(key);
+			client->decrypt_ctx = crypto_ctx_new_reader(key);
+			if (!client->encrypt_ctx || !client->decrypt_ctx) {
+				debug(LOG_ERR, "Failed to create crypto contexts");
+			} else {
+				debug(LOG_INFO, "Proxy [%s] encryption enabled (AES-128-CFB)", ps->proxy_name);
+			}
+		}
+	}
+	if (client->use_compression) {
+		debug(LOG_INFO, "Proxy [%s] compression enabled (snappy)", ps->proxy_name);
 	}
 
 	if (setup_local_connection(client) <= 0) {
 		return;
 	}
-
-	struct common_conf *c_conf = get_common_config();
-	struct proxy_service *ps = client->ps;
 
 	debug(LOG_DEBUG, "proxy server [%s:%d] <---> client [%s:%d]", 
 		  c_conf->server_addr, ps->remote_port,
@@ -342,9 +444,29 @@ int send_client_data_tail(struct proxy_client *client)
 		return -1;
 	}
 
-	int bytes_written = bufferevent_write(client->local_proxy_bev,
-										client->data_tail,
-										client->data_tail_size);
+	int bytes_written = 0;
+	if (client->use_encryption || client->use_compression) {
+		struct evbuffer *src = evbuffer_new();
+		struct evbuffer *plain = evbuffer_new();
+		if (!src || !plain) {
+			if (src) evbuffer_free(src);
+			if (plain) evbuffer_free(plain);
+			free(client->data_tail);
+			client->data_tail = NULL;
+			client->data_tail_size = 0;
+			return -1;
+		}
+		evbuffer_add(src, client->data_tail, client->data_tail_size);
+		proxy_crypto_decode_evbuffer(client, src, plain);
+		bytes_written = (int)evbuffer_get_length(plain);
+		evbuffer_add_buffer(bufferevent_get_output(client->local_proxy_bev), plain);
+		evbuffer_free(src);
+		evbuffer_free(plain);
+	} else {
+		bytes_written = bufferevent_write(client->local_proxy_bev,
+						client->data_tail,
+						client->data_tail_size);
+	}
 
 	free(client->data_tail);
 	client->data_tail = NULL;
@@ -366,9 +488,24 @@ free_proxy_client(struct proxy_client *client)
 
 	debug(LOG_DEBUG, "Freeing proxy client with stream ID: %d", client->stream_id);
 
+	/* Clean up visitor session if this is a visitor client.
+	 * NULL out visitor_ctx to prevent dangling pointer.
+	 * The session's user_bev is the same as local_proxy_bev,
+	 * which is freed below. We just free the session shell. */
+	if (client->visitor_ctx) {
+		free(client->visitor_ctx);
+		client->visitor_ctx = NULL;
+	}
+
 	if (client->local_proxy_bev) {
 		bufferevent_free(client->local_proxy_bev);
 		client->local_proxy_bev = NULL;
+	}
+
+	/* Free stashed encrypted data */
+	if (client->enc_pending) {
+		evbuffer_free(client->enc_pending);
+		client->enc_pending = NULL;
 	}
 
 	/* Free data tail */
@@ -386,6 +523,21 @@ free_proxy_client(struct proxy_client *client)
 	if (client->xdpi_buf) {
 		free(client->xdpi_buf);
 		client->xdpi_buf = NULL;
+	}
+
+	SAFE_FREE(client->udp_laddr);
+	SAFE_FREE(client->udp_lzone);
+	SAFE_FREE(client->udp_raddr);
+	SAFE_FREE(client->udp_rzone);
+
+	/* Free encryption contexts */
+	if (client->encrypt_ctx) {
+		crypto_ctx_free(client->encrypt_ctx);
+		client->encrypt_ctx = NULL;
+	}
+	if (client->decrypt_ctx) {
+		crypto_ctx_free(client->decrypt_ctx);
+		client->decrypt_ctx = NULL;
 	}
 
 	tmux_stream_release(&client->stream);
@@ -529,38 +681,34 @@ int xdpi_engine(struct proxy_client *client, const unsigned char *data, size_t l
 
 	switch (ps->service_type) {
 		case SERVICE_SSH:
-			if (len >= 20 && data[0] == 'S' && data[1] == 'S' && data[2] == 'H') {
-				const char *known_clients[] = {
-					"OpenSSH", "PuTTY", "WinSCP", "FileZilla", "SecureCRT",
-					"Xshell", "Bitvise", "SSH Tectia", "Tera Term", "KiTTY",
-					"Royal TSX", "Termius", "Tabby", "Cyberduck", "ForkLift",
-					"Transmit", "CoreFTP", "SmartFTP", "FlashFXP", "FTP Rush",
-					NULL
-				};
-
-				for (int i = 0; known_clients[i] != NULL; i++) {
-					if (strstr((const char *)data, known_clients[i]) != NULL) {
-						client->xdpi_state = XDPI_VERIFIED;
-						debug(LOG_INFO, "XDPI engine detected valid SSH client: %s", known_clients[i]);
-						return 0;
-					}
-				}
-
-				debug(LOG_WARNING, "XDPI engine detected unknown SSH client, blocking connection");
-				debug(LOG_WARNING, "data: %s", data);
-				client->xdpi_state = XDPI_BLOCKED;
-				return -1;
+			/* Verify SSH banner format per RFC 4253: SSH-protoversion-softwareversion
+			 * Must start with "SSH-2.0-" and banner length <= 255 bytes */
+			if (len >= 8 && len <= 255 &&
+			    data[0] == 'S' && data[1] == 'S' && data[2] == 'H' &&
+			    data[3] == '-' && data[4] == '2' && data[5] == '.' &&
+			    data[6] == '0' && data[7] == '-') {
+				client->xdpi_state = XDPI_VERIFIED;
+				debug(LOG_INFO, "XDPI engine verified SSH-2.0 banner (%zu bytes)", len);
+				return 0;
 			}
 			break;
 
 		case SERVICE_HTTP:
-			if (len >= 4 && 
+			/* Check for HTTP request methods and verify HTTP/ prefix exists */
+			if (len >= 8 &&
 				((data[0] == 'G' && data[1] == 'E' && data[2] == 'T' && data[3] == ' ') ||
 				 (data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T') ||
 				 (data[0] == 'H' && data[1] == 'E' && data[2] == 'A' && data[3] == 'D') ||
-				 (data[0] == 'P' && data[1] == 'U' && data[2] == 'T' && data[3] == ' '))) {
-				client->xdpi_state = XDPI_VERIFIED;
-				return 0;
+				 (data[0] == 'P' && data[1] == 'U' && data[2] == 'T' && data[3] == ' ') ||
+				 (data[0] == 'D' && data[1] == 'E' && data[2] == 'L' && data[3] == 'E'))) {
+				/* Search for " HTTP/" in the request line to validate format */
+				for (size_t i = 4; i + 5 < len; i++) {
+					if (data[i] == ' ' && data[i+1] == 'H' && data[i+2] == 'T' &&
+					    data[i+3] == 'T' && data[i+4] == 'P' && data[i+5] == '/') {
+						client->xdpi_state = XDPI_VERIFIED;
+						return 0;
+					}
+				}
 			}
 			break;
 
@@ -570,23 +718,17 @@ int xdpi_engine(struct proxy_client *client, const unsigned char *data, size_t l
 				return 0;
 			}
 			break;
-		case SERVICE_MSTSC:
-			if (len == 47 && data[0] == 0x03 && data[1] == 0x00 && data[2] == 0x00 && data[5] == 0xe0) {
-				if (memcmp((const char *)&data[11], "Cookie:", 7) == 0 && data[43] == 0x0b) {
-					client->xdpi_state = XDPI_VERIFIED;
-					debug(LOG_INFO, "XDPI engine verified the RDP protocol, len: %zu", len);
-					return 0;
-				} 
-			} 
 
-			debug(LOG_WARNING, "XDPI engine detected unknown RDP client, len: %zu", len);
-			break;
+		case SERVICE_MSTSC:
 		case SERVICE_RDP:
+			/* RDP Connection Request: TPKT header (0x03, 0x00) + length >= 19 */
 			if (len >= 19 && data[0] == 0x03 && data[1] == 0x00 && data[2] == 0x00) {
 				client->xdpi_state = XDPI_VERIFIED;
+				debug(LOG_INFO, "XDPI engine verified RDP protocol (%zu bytes)", len);
 				return 0;
 			}
 			break;
+
 		case SERVICE_VNC:
 			if (len >= 4 && data[0] == 'R' && data[1] == 'F' && data[2] == 'B' && data[3] == ' ') {
 				client->xdpi_state = XDPI_VERIFIED;

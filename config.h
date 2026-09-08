@@ -26,9 +26,6 @@
 #define XFRPC_PLUGIN_YOUTUBEDL_PORT          20002
 #define XFRPC_PLUGIN_YOUTUBEDL_REMOTE_PORT   20003
 
-// FTP related definitions
-#define FTP_RMT_CTL_PROXY_SUFFIX  "_ftp_remote_ctl_proxy"
-
 /**
  * Common configuration structure for the client
  */
@@ -38,10 +35,30 @@ struct common_conf {
 	int     server_port;           /* default 7000 */
 	char    *auth_token;
 
+	/* OIDC settings */
+	char    *auth_method;          /* "token" (default) or "oidc" */
+	char    *oidc_client_id;
+	char    *oidc_client_secret;
+	char    *oidc_audience;
+	char    *oidc_scope;
+	char    *oidc_token_endpoint_url;
+	char    *oidc_trusted_ca_file;
+	int     oidc_insecure_skip_verify;
+	char    *oidc_proxy_url;
+
 	/* Connection settings */
 	int     heartbeat_interval;    /* default 10 */
 	int     heartbeat_timeout;     /* default 30 */
 	int     tcp_mux;              /* default 0 */
+
+	/* Transport protocol: "tcp" (default), "quic" */
+	char    *protocol;
+
+	/* Wire protocol: "v1" (default) or "v2" (frp >= 0.69) */
+	char    *wire_protocol;
+
+	/* QUIC settings */
+	int     quic_bind_port;       /* frps QUIC port, default 0 (disabled) */
 
 	/* TLS settings */
 	int     tls_enable;           /* default 0 */
@@ -49,6 +66,9 @@ struct common_conf {
 	char    *tls_key_file;        /* client private key file (optional) */
 	char    *tls_trusted_ca_file; /* CA certificate file for verification */
 	char    *tls_server_name;     /* SNI server name (optional) */
+
+	/* Identity settings */
+	char    *user;                /* client user name (for visitor auth) */
 
 	/* Environment settings */
 	int     is_router;            /* indicates if running on router (OpenWrt/LEDE) */
@@ -66,7 +86,7 @@ void free_proxy_service(struct proxy_service *ps);
 void free_all_proxy_services(void);
 int validate_proxy(struct proxy_service *ps);
 
-/* FTP specific functions */
-char *get_ftp_data_proxy_name(const char *ftp_proxy_name);
+/* Visitor section parser (called from INI handler) */
+int parse_visitor_section(const char *section_name, const char *key, const char *value);
 
 #endif //XFRPC_CONFIG_H

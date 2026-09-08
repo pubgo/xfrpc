@@ -11,6 +11,10 @@
 #include "common.h"
 #include "tcpmux.h"
 
+/* Forward declarations for crypto stream types */
+struct crypto_ctx;
+struct snappy_ctx;
+
 /* Constants */
 #define SOCKS5_ADDRES_LEN 20
 
@@ -59,6 +63,7 @@ struct proxy_client {
 	/* Configuration */
 	struct base_conf     *bconf;
 	struct proxy_service *ps;
+	void                 *visitor_ctx;  /* visitor_session backpointer */
 	
 	/* Stream handling */
 	struct tmux_stream   stream;
@@ -78,6 +83,10 @@ struct proxy_client {
 	unsigned char       *data_tail;
 	size_t              data_tail_size;
 
+	/* Encrypted-but-unsent data when the mux window is exhausted; kept
+	 * separately so it is never re-encrypted on the next read callback */
+	struct evbuffer    *enc_pending;
+
 	/* Per-client receive buffers (replace rx_ring for protocol parsing) */
 	uint8_t            *socks5_buf;     /* SOCKS5 parser staging buffer */
 	size_t              socks5_buf_len;
@@ -89,6 +98,20 @@ struct proxy_client {
 
 	/* Hash handling */
 	UT_hash_handle      hh;
+
+	/* Encryption state (populated from proxy_service) */
+	int                 use_encryption;
+	int                 use_compression;
+	struct crypto_ctx   *encrypt_ctx;   /* AES-128-CFB writer context */
+	struct crypto_ctx   *decrypt_ctx;   /* AES-128-CFB reader context */
+
+	/* Last UDP peer addresses from TypeUDPPacket (needed for replies) */
+	char                *udp_laddr;
+	int                  udp_lport;
+	char                *udp_lzone;
+	char                *udp_raddr;
+	int                  udp_rport;
+	char                *udp_rzone;
 };
 
 struct proxy_service {
@@ -119,9 +142,9 @@ struct proxy_service {
 	char    *host_header_rewrite;
 	char    *http_user;
 	char    *http_pwd;
+	char    *request_headers;   /* comma-separated key=value pairs */
+	char    *response_headers;  /* comma-separated key=value pairs */
 
-	/* FTP specific */
-	char    *ftp_cfg_proxy_name;
 	char    *s_root_dir;
 
 	/* Load balancing */
@@ -141,6 +164,16 @@ struct proxy_service {
 	char    *sk;                 /* Secret key for stcp/xtcp/sudp */
 	char    *allow_users;        /* Comma-separated list of allowed visitor users */
 
+	/* Unix Domain Socket plugin specific */
+	char    *plugin_unix_path;   /* Unix socket path for unix_domain_socket plugin */
+
+	/* Health check configuration */
+	char    *health_check_type;    /* "tcp" or "http" (NULL = disabled) */
+	char    *health_check_url;     /* URL path for HTTP health check (default "/") */
+	int     health_check_interval; /* Seconds between checks (default 10) */
+	int     health_check_timeout;  /* Per-check timeout in seconds (default 3) */
+	int     health_check_max_failed; /* Consecutive failures before marking down (default 1) */
+
 	/* Hash handling */
 	UT_hash_handle hh;
 };
@@ -150,11 +183,11 @@ void start_xfrp_tunnel(struct proxy_client *client);
 void del_proxy_client_by_stream_id(uint32_t sid);
 struct proxy_client *get_proxy_client(uint32_t sid);
 int send_client_data_tail(struct proxy_client *client);
-int is_ftp_proxy(const struct proxy_service *ps);
 int is_socks5_proxy(const struct proxy_service *ps);
 int is_udp_proxy(const struct proxy_service *ps);
 int is_tcpmux_proxy(const struct proxy_service *ps);
 int is_stcp_proxy(const struct proxy_service *ps);
+int is_uds_proxy(const struct proxy_service *ps);
 int has_service_type(const struct proxy_service *ps);
 struct proxy_client *new_proxy_client(void);
 void clear_all_proxy_client(void);

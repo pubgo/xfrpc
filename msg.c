@@ -7,7 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <json-c/json.h>
-#include <openssl/evp.h>
+#include "ssl_compat.h"
 #include <time.h>
 #include <assert.h>
 #include <syslog.h>
@@ -20,6 +20,7 @@
 #include "login.h"
 #include "client.h"
 #include "utils.h"
+#include "oidc_auth.h"
 
 /**
  * @brief Macro to add a typed value to a JSON object
@@ -193,7 +194,7 @@ char *get_auth_key(const char *token, time_t *timestamp)
 	// Create seed string
 	char seed[128] = {0};
 	int ret = snprintf(seed, sizeof(seed), "%s%jd", 
-					  token ? token : "", *timestamp);
+					  token ? token : "", (intmax_t)*timestamp);
 	if (ret < 0 || ret >= sizeof(seed)) {
 		return NULL;
 	}
@@ -240,12 +241,37 @@ size_t login_request_marshal(char **msg)
 		return 0;
 	}
 
-	// Generate new auth key
+	// Generate auth key based on auth method
 	struct common_conf *cf = get_common_config();
-	char *auth_key = get_auth_key(cf->auth_token, &lg->timestamp);
-	if (!auth_key) {
-		json_object_put(j_login_req);
-		return 0;
+	char *auth_key = NULL;
+
+	if (cf->auth_method && strcmp(cf->auth_method, "oidc") == 0) {
+		/* OIDC authentication: fetch access token from token endpoint */
+		if (!cf->oidc_token_endpoint_url || !cf->oidc_client_id || !cf->oidc_client_secret) {
+			debug(LOG_ERR, "OIDC auth requires auth.oidc.clientID, clientSecret, and tokenEndpointURL");
+			json_object_put(j_login_req);
+			return 0;
+		}
+		auth_key = oidc_fetch_token(cf->oidc_token_endpoint_url,
+		                            cf->oidc_client_id,
+		                            cf->oidc_client_secret,
+		                            cf->oidc_audience,
+		                            cf->oidc_scope,
+		                            cf->oidc_trusted_ca_file,
+		                            cf->oidc_insecure_skip_verify);
+		if (!auth_key) {
+			debug(LOG_ERR, "Failed to fetch OIDC access token");
+			json_object_put(j_login_req);
+			return 0;
+		}
+		lg->timestamp = time(NULL);
+	} else {
+		/* Token authentication (default): HMAC-based auth key */
+		auth_key = get_auth_key(cf->auth_token, &lg->timestamp);
+		if (!auth_key) {
+			json_object_put(j_login_req);
+			return 0;
+		}
 	}
 
 	// Update privilege key
@@ -351,11 +377,6 @@ int new_proxy_service_marshal(const struct proxy_service *np_req, char **msg)
 		}
 	}
 
-	// Handle FTP specific configuration
-	if (is_ftp_proxy(np_req)) {
-		JSON_MARSHAL_TYPE(j_np_req, "remote_data_port", int, np_req->remote_data_port);
-	}
-
 	// Handle domains and ports
 	if (np_req->custom_domains) {
 		fill_custom_domains(j_np_req, np_req->custom_domains);
@@ -395,6 +416,56 @@ int new_proxy_service_marshal(const struct proxy_service *np_req, char **msg)
 	JSON_MARSHAL_TYPE(j_np_req, "host_header_rewrite", string, SAFE_JSON_STRING(np_req->host_header_rewrite));
 	JSON_MARSHAL_TYPE(j_np_req, "http_user", string, SAFE_JSON_STRING(np_req->http_user));
 	JSON_MARSHAL_TYPE(j_np_req, "http_pwd", string, SAFE_JSON_STRING(np_req->http_pwd));
+
+	// Add request headers (headers map)
+	if (np_req->request_headers) {
+		struct json_object *j_headers = json_object_new_object();
+		char *hdr_copy = strdup(np_req->request_headers);
+		if (hdr_copy && j_headers) {
+			char *save_ptr = NULL;
+			char *pair = strtok_r(hdr_copy, ",", &save_ptr);
+			while (pair) {
+				char *eq = strchr(pair, '=');
+				if (eq) {
+					*eq = '\0';
+					json_object_object_add(j_headers, pair, json_object_new_string(eq + 1));
+				}
+				pair = strtok_r(NULL, ",", &save_ptr);
+			}
+			json_object_object_add(j_np_req, "headers", j_headers);
+		} else {
+			json_object_object_add(j_np_req, "headers", NULL);
+			if (j_headers) json_object_put(j_headers);
+		}
+		free(hdr_copy);
+	} else {
+		json_object_object_add(j_np_req, "headers", NULL);
+	}
+
+	// Add response headers (response_headers map)
+	if (np_req->response_headers) {
+		struct json_object *j_resp_headers = json_object_new_object();
+		char *hdr_copy = strdup(np_req->response_headers);
+		if (hdr_copy && j_resp_headers) {
+			char *save_ptr = NULL;
+			char *pair = strtok_r(hdr_copy, ",", &save_ptr);
+			while (pair) {
+				char *eq = strchr(pair, '=');
+				if (eq) {
+					*eq = '\0';
+					json_object_object_add(j_resp_headers, pair, json_object_new_string(eq + 1));
+				}
+				pair = strtok_r(NULL, ",", &save_ptr);
+			}
+			json_object_object_add(j_np_req, "response_headers", j_resp_headers);
+		} else {
+			json_object_object_add(j_np_req, "response_headers", NULL);
+			if (j_resp_headers) json_object_put(j_resp_headers);
+		}
+		free(hdr_copy);
+	} else {
+		json_object_object_add(j_np_req, "response_headers", NULL);
+	}
 
 	// Add TCPMux specific fields
 	if (strcmp(proxy_type, "tcpmux") == 0) {
@@ -523,18 +594,15 @@ struct new_proxy_response *new_proxy_resp_unmarshal(const char *jres)
 		}
 	}
 
-	// Get required remote_addr field
+	// Get optional remote_addr field (absent for STCP/sudp when empty in newer frps)
 	struct json_object *j_remote_addr = NULL;
-	if (!json_object_object_get_ex(j_np_res, "remote_addr", &j_remote_addr)) {
-		goto error;
-	}
-	
-	// Parse port from remote_addr
-	const char *remote_addr = json_object_get_string(j_remote_addr);
-	if (remote_addr) {
-		const char *port = strrchr(remote_addr, ':');
-		if (port) {
-			npr->remote_port = atoi(port + 1);
+	if (json_object_object_get_ex(j_np_res, "remote_addr", &j_remote_addr)) {
+		const char *remote_addr = json_object_get_string(j_remote_addr);
+		if (remote_addr) {
+			const char *port = strrchr(remote_addr, ':');
+			if (port) {
+				npr->remote_port = atoi(port + 1);
+			}
 		}
 	}
 
@@ -923,16 +991,16 @@ static struct udp_addr *parse_udp_addr(struct json_object *j_addr) {
 
 	struct json_object *j_ip = NULL, *j_port = NULL, *j_zone = NULL;
 	if (!json_object_object_get_ex(j_addr, "IP", &j_ip) ||
-		!json_object_object_get_ex(j_addr, "Port", &j_port) ||
-		!json_object_object_get_ex(j_addr, "Zone", &j_zone)) {
+		!json_object_object_get_ex(j_addr, "Port", &j_port)) {
 		return NULL;
 	}
+	json_object_object_get_ex(j_addr, "Zone", &j_zone);
 
 	struct udp_addr *addr = calloc(1, sizeof(struct udp_addr));
 	if (!addr) return NULL;
 
 	addr->addr = strdup(json_object_get_string(j_ip));
-	addr->zone = strdup(json_object_get_string(j_zone));
+	addr->zone = strdup(j_zone ? json_object_get_string(j_zone) : "");
 	addr->port = json_object_get_int(j_port);
 
 	if (!addr->addr || !addr->zone) {
@@ -971,21 +1039,13 @@ struct udp_packet *udp_packet_unmarshal(const char *msg) {
 	udp->content = strdup(json_object_get_string(j_content));
 	if (!udp->content) goto error;
 
-	// Parse local address
 	struct json_object *j_laddr = NULL;
-	if (!json_object_object_get_ex(j_udp, "l", &j_laddr)) {
-		goto error;
-	}
-	udp->laddr = parse_udp_addr(j_laddr);
-	if (!udp->laddr) goto error;
+	if (json_object_object_get_ex(j_udp, "l", &j_laddr))
+		udp->laddr = parse_udp_addr(j_laddr);
 
-	// Parse remote address
 	struct json_object *j_raddr = NULL;
-	if (!json_object_object_get_ex(j_udp, "r", &j_raddr)) {
-		goto error;
-	}
-	udp->raddr = parse_udp_addr(j_raddr);
-	if (!udp->raddr) goto error;
+	if (json_object_object_get_ex(j_udp, "r", &j_raddr))
+		udp->raddr = parse_udp_addr(j_raddr);
 
 	json_object_put(j_udp);
 	return udp;
@@ -994,4 +1054,321 @@ error:
 	json_object_put(j_udp);
 	udp_packet_free(udp);
 	return NULL;
+}
+
+/* ============================================================
+ * NatHole message marshalling/unmarshalling
+ * ============================================================ */
+
+/**
+ * @brief Marshal a NatHoleVisitor message to JSON string
+ *
+ * @param msg  The NatHoleVisitor message to marshal
+ * @param out  Output JSON string (caller must free)
+ * @return Length of output string, 0 on failure
+ */
+int nathole_visitor_marshal(const struct nathole_visitor_msg *msg, char **out)
+{
+	if (!msg || !out) return 0;
+
+	struct json_object *jobj = json_object_new_object();
+	if (!jobj) return 0;
+
+	if (msg->transaction_id)
+		json_object_object_add(jobj, "transaction_id",
+			json_object_new_string(msg->transaction_id));
+	if (msg->proxy_name)
+		json_object_object_add(jobj, "proxy_name",
+			json_object_new_string(msg->proxy_name));
+	json_object_object_add(jobj, "pre_check",
+		json_object_new_boolean(msg->pre_check));
+	if (msg->protocol)
+		json_object_object_add(jobj, "protocol",
+			json_object_new_string(msg->protocol));
+	if (msg->sign_key)
+		json_object_object_add(jobj, "sign_key",
+			json_object_new_string(msg->sign_key));
+	if (sizeof(time_t) == 4) {
+		json_object_object_add(jobj, "timestamp",
+			json_object_new_int((int32_t)msg->timestamp));
+	} else {
+		json_object_object_add(jobj, "timestamp",
+			json_object_new_int64((int64_t)msg->timestamp));
+	}
+
+	/* mapped_addrs array */
+	struct json_object *j_mapped = json_object_new_array();
+	for (int i = 0; i < msg->mapped_addrs_count; i++) {
+		json_object_array_add(j_mapped,
+			json_object_new_string(msg->mapped_addrs[i]));
+	}
+	json_object_object_add(jobj, "mapped_addrs", j_mapped);
+
+	/* assisted_addrs array */
+	struct json_object *j_assisted = json_object_new_array();
+	for (int i = 0; i < msg->assisted_addrs_count; i++) {
+		json_object_array_add(j_assisted,
+			json_object_new_string(msg->assisted_addrs[i]));
+	}
+	json_object_object_add(jobj, "assisted_addrs", j_assisted);
+
+	const char *json_str = json_object_to_json_string(jobj);
+	int len = 0;
+	if (json_str) {
+		*out = strdup(json_str);
+		if (*out) len = strlen(json_str);
+	}
+
+	json_object_put(jobj);
+	return len;
+}
+
+/**
+ * @brief Marshal a NatHoleClient message to JSON string
+ */
+int nathole_client_marshal(const struct nathole_client_msg *msg, char **out)
+{
+	if (!msg || !out) return 0;
+
+	struct json_object *jobj = json_object_new_object();
+	if (!jobj) return 0;
+
+	if (msg->transaction_id)
+		json_object_object_add(jobj, "transaction_id",
+			json_object_new_string(msg->transaction_id));
+	if (msg->proxy_name)
+		json_object_object_add(jobj, "proxy_name",
+			json_object_new_string(msg->proxy_name));
+	if (msg->sid)
+		json_object_object_add(jobj, "sid",
+			json_object_new_string(msg->sid));
+
+	/* mapped_addrs array */
+	if (msg->mapped_addrs_count > 0 && msg->mapped_addrs) {
+		struct json_object *jarr = json_object_new_array();
+		for (int i = 0; i < msg->mapped_addrs_count; i++) {
+			if (msg->mapped_addrs[i])
+				json_object_array_add(jarr,
+					json_object_new_string(msg->mapped_addrs[i]));
+		}
+		json_object_object_add(jobj, "mapped_addrs", jarr);
+	}
+
+	/* assisted_addrs array */
+	if (msg->assisted_addrs_count > 0 && msg->assisted_addrs) {
+		struct json_object *jarr = json_object_new_array();
+		for (int i = 0; i < msg->assisted_addrs_count; i++) {
+			if (msg->assisted_addrs[i])
+				json_object_array_add(jarr,
+					json_object_new_string(msg->assisted_addrs[i]));
+		}
+		json_object_object_add(jobj, "assisted_addrs", jarr);
+	}
+
+	const char *json_str = json_object_to_json_string(jobj);
+	int len = 0;
+	if (json_str) {
+		*out = strdup(json_str);
+		if (*out) len = strlen(json_str);
+	}
+
+	json_object_put(jobj);
+	return len;
+}
+
+/**
+ * @brief Marshal a NatHoleReport message to JSON string
+ */
+int nathole_report_marshal(const struct nathole_report_msg *msg, char **out)
+{
+	if (!msg || !out) return 0;
+
+	struct json_object *jobj = json_object_new_object();
+	if (!jobj) return 0;
+
+	if (msg->sid)
+		json_object_object_add(jobj, "sid",
+			json_object_new_string(msg->sid));
+	json_object_object_add(jobj, "success",
+		json_object_new_boolean(msg->success));
+
+	const char *json_str = json_object_to_json_string(jobj);
+	int len = 0;
+	if (json_str) {
+		*out = strdup(json_str);
+		if (*out) len = strlen(json_str);
+	}
+
+	json_object_put(jobj);
+	return len;
+}
+
+/* Helper to parse a JSON string array field */
+#define MAX_PARSED_ADDRS 64
+
+static int parse_json_string_array(struct json_object *jobj, const char *key,
+				   char ***out_arr, int *out_count)
+{
+	struct json_object *jarr = NULL;
+	if (!json_object_object_get_ex(jobj, key, &jarr) || !jarr) {
+		*out_arr = NULL;
+		*out_count = 0;
+		return 0;
+	}
+
+	int count = json_object_array_length(jarr);
+	/* bound the allocation: the array comes from the network */
+	if (count > MAX_PARSED_ADDRS)
+		count = MAX_PARSED_ADDRS;
+	if (count <= 0) {
+		*out_arr = NULL;
+		*out_count = 0;
+		return 0;
+	}
+
+	char **arr = calloc(count, sizeof(char *));
+	if (!arr) return -1;
+
+	for (int i = 0; i < count; i++) {
+		struct json_object *item = json_object_array_get_idx(jarr, i);
+		const char *str = item ? json_object_get_string(item) : NULL;
+		if (str)
+			arr[i] = strdup(str);
+	}
+
+	*out_arr = arr;
+	*out_count = count;
+	return 0;
+}
+
+/**
+ * @brief Unmarshal a NatHoleResp message from JSON string
+ */
+struct nathole_resp_msg *nathole_resp_unmarshal(const char *json_str)
+{
+	if (!json_str) return NULL;
+
+	struct json_object *jobj = json_tokener_parse(json_str);
+	if (!jobj) return NULL;
+
+	struct nathole_resp_msg *resp = calloc(1, sizeof(struct nathole_resp_msg));
+	if (!resp) {
+		json_object_put(jobj);
+		return NULL;
+	}
+
+	struct json_object *val;
+
+	if (json_object_object_get_ex(jobj, "transaction_id", &val))
+		resp->transaction_id = strdup(json_object_get_string(val));
+	if (json_object_object_get_ex(jobj, "sid", &val))
+		resp->sid = strdup(json_object_get_string(val));
+	if (json_object_object_get_ex(jobj, "protocol", &val))
+		resp->protocol = strdup(json_object_get_string(val));
+	if (json_object_object_get_ex(jobj, "error", &val))
+		resp->error = strdup(json_object_get_string(val));
+
+	/* Parse address arrays */
+	parse_json_string_array(jobj, "candidate_addrs",
+				&resp->candidate_addrs, &resp->candidate_addrs_count);
+	parse_json_string_array(jobj, "assisted_addrs",
+				&resp->assisted_addrs, &resp->assisted_addrs_count);
+
+	/* Parse detect_behavior */
+	struct json_object *jbeh = NULL;
+	if (json_object_object_get_ex(jobj, "detect_behavior", &jbeh) && jbeh) {
+		if (json_object_object_get_ex(jbeh, "mode", &val))
+			resp->behavior_mode = json_object_get_int(val);
+		if (json_object_object_get_ex(jbeh, "role", &val))
+			resp->behavior_role = strdup(json_object_get_string(val));
+		if (json_object_object_get_ex(jbeh, "ttl", &val))
+			resp->behavior_ttl = json_object_get_int(val);
+		if (json_object_object_get_ex(jbeh, "send_delay_ms", &val))
+			resp->behavior_send_delay_ms = json_object_get_int(val);
+		if (json_object_object_get_ex(jbeh, "read_timeout", &val))
+			resp->behavior_read_timeout_ms = json_object_get_int(val);
+		if (json_object_object_get_ex(jbeh, "send_random_ports", &val))
+			resp->behavior_send_random_ports = json_object_get_int(val);
+		if (json_object_object_get_ex(jbeh, "listen_random_ports", &val))
+			resp->behavior_listen_random_ports = json_object_get_int(val);
+
+		/* candidate_ports array */
+		struct json_object *jports = NULL;
+		if (json_object_object_get_ex(jbeh, "candidate_ports", &jports) && jports) {
+			int pc = json_object_array_length(jports);
+			if (pc > 0) {
+				resp->candidate_ports_from = calloc(pc, sizeof(int));
+				resp->candidate_ports_to = calloc(pc, sizeof(int));
+				if (resp->candidate_ports_from && resp->candidate_ports_to) {
+					for (int i = 0; i < pc; i++) {
+						struct json_object *pr = json_object_array_get_idx(jports, i);
+						struct json_object *jfrom, *jto;
+						if (pr &&
+						    json_object_object_get_ex(pr, "from", &jfrom) &&
+						    json_object_object_get_ex(pr, "to", &jto)) {
+							resp->candidate_ports_from[i] = json_object_get_int(jfrom);
+							resp->candidate_ports_to[i] = json_object_get_int(jto);
+						}
+					}
+					resp->candidate_ports_count = pc;
+				}
+			}
+		}
+	}
+
+	json_object_put(jobj);
+	return resp;
+}
+
+/**
+ * @brief Free a nathole_resp_msg structure
+ */
+void nathole_resp_msg_free(struct nathole_resp_msg *msg)
+{
+	if (!msg) return;
+	SAFE_FREE(msg->transaction_id);
+	SAFE_FREE(msg->sid);
+	SAFE_FREE(msg->protocol);
+	SAFE_FREE(msg->error);
+	SAFE_FREE(msg->behavior_role);
+	for (int i = 0; i < msg->candidate_addrs_count; i++)
+		SAFE_FREE(msg->candidate_addrs[i]);
+	SAFE_FREE(msg->candidate_addrs);
+	for (int i = 0; i < msg->assisted_addrs_count; i++)
+		SAFE_FREE(msg->assisted_addrs[i]);
+	SAFE_FREE(msg->assisted_addrs);
+	SAFE_FREE(msg->candidate_ports_from);
+	SAFE_FREE(msg->candidate_ports_to);
+	free(msg);
+}
+
+void nathole_visitor_msg_free(struct nathole_visitor_msg *msg)
+{
+	if (!msg) return;
+	SAFE_FREE(msg->transaction_id);
+	SAFE_FREE(msg->proxy_name);
+	SAFE_FREE(msg->protocol);
+	SAFE_FREE(msg->sign_key);
+	for (int i = 0; i < msg->mapped_addrs_count; i++)
+		SAFE_FREE(msg->mapped_addrs[i]);
+	SAFE_FREE(msg->mapped_addrs);
+	for (int i = 0; i < msg->assisted_addrs_count; i++)
+		SAFE_FREE(msg->assisted_addrs[i]);
+	SAFE_FREE(msg->assisted_addrs);
+	free(msg);
+}
+
+void nathole_client_msg_free(struct nathole_client_msg *msg)
+{
+	if (!msg) return;
+	SAFE_FREE(msg->transaction_id);
+	SAFE_FREE(msg->proxy_name);
+	SAFE_FREE(msg->sid);
+	for (int i = 0; i < msg->mapped_addrs_count; i++)
+		SAFE_FREE(msg->mapped_addrs[i]);
+	SAFE_FREE(msg->mapped_addrs);
+	for (int i = 0; i < msg->assisted_addrs_count; i++)
+		SAFE_FREE(msg->assisted_addrs[i]);
+	SAFE_FREE(msg->assisted_addrs);
+	free(msg);
 }

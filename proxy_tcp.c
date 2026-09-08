@@ -27,6 +27,8 @@
 #include "config.h"
 #include "tcpmux.h"
 #include "control.h"
+#include "crypto_stream.h"
+#include "vendor/snappy/snappy.h"
 
 /** @brief Maximum buffer size for SOCKS5 protocol data */
 #define SOCKS5_BUFFER_SIZE 2048
@@ -422,6 +424,128 @@ void handle_xdpi(struct proxy_client *client, struct bufferevent *bev, uint32_t 
 /**
  * @brief Callback function handling data transfer from client to server in TCP proxy
  */
+/**
+ * @brief Apply encryption and compression to data for sending (client→server)
+ *
+ * Compresses with snappy (if enabled), then encrypts with AES-128-CFB.
+ * On first call, prepends 16-byte IV to the output.
+ *
+ * @param client Proxy client with crypto contexts
+ * @param src Source evbuffer (raw data)
+ * @param dst Destination evbuffer (encrypted/compressed data)
+ */
+static void crypto_encode_evbuffer(struct proxy_client *client,
+                                   struct evbuffer *src, struct evbuffer *dst)
+{
+	size_t len = evbuffer_get_length(src);
+	if (len == 0) return;
+
+	/* Pull data into contiguous buffer */
+	uint8_t *data = evbuffer_pullup(src, len);
+	if (!data) return;
+
+	/* Compression: output may be larger than input */
+	size_t comp_len = 0;
+	uint8_t *comp_data = NULL;
+	if (client->use_compression) {
+		size_t max_comp = snappy_max_compressed_length(len);
+		comp_data = malloc(max_comp);
+		if (comp_data) {
+			if (xfrpc_compress(data, len, comp_data, &max_comp) == 0) {
+				comp_len = max_comp;
+			} else {
+				free(comp_data);
+				comp_data = NULL;
+			}
+		}
+	}
+
+	/* Use compressed data if available, otherwise raw */
+	uint8_t *work_data = comp_data ? comp_data : data;
+	size_t work_len = comp_data ? comp_len : len;
+
+	/* Encryption: encrypt in-place, prepend IV on first call */
+	if (client->use_encryption && client->encrypt_ctx) {
+		/* Prepend IV on first call */
+		if (!crypto_writer_iv_sent(client->encrypt_ctx)) {
+			uint8_t iv[16];
+			crypto_get_iv(client->encrypt_ctx, iv);
+			evbuffer_add(dst, iv, 16);
+			crypto_writer_set_iv_sent(client->encrypt_ctx);
+		}
+		crypto_encrypt(client->encrypt_ctx, work_data, work_len);
+	}
+
+	evbuffer_add(dst, work_data, work_len);
+	evbuffer_drain(src, len);
+
+	free(comp_data);
+}
+
+/**
+ * @brief Apply decryption and decompression to data for receiving (server→client)
+ *
+ * On first call, reads 16-byte IV from input.
+ * Decrypts with AES-128-CFB, then decompresses with snappy.
+ *
+ * @param client Proxy client with crypto contexts
+ * @param src Source evbuffer (encrypted/compressed data)
+ * @param dst Destination evbuffer (raw data)
+ */
+void proxy_crypto_decode_evbuffer(struct proxy_client *client,
+                                   struct evbuffer *src, struct evbuffer *dst)
+{
+	size_t len = evbuffer_get_length(src);
+	if (len == 0) return;
+
+	/* Read IV on first call */
+	if (client->use_encryption && client->decrypt_ctx &&
+	    !crypto_reader_iv_received(client->decrypt_ctx)) {
+		if (len < 16) return; /* Need more data for IV */
+		uint8_t iv[16];
+		evbuffer_remove(src, iv, 16);
+		crypto_set_iv(client->decrypt_ctx, iv);
+		crypto_reader_set_iv_received(client->decrypt_ctx);
+		len -= 16;
+		if (len == 0) return;
+	}
+
+	/* Pull remaining data */
+	uint8_t *data = evbuffer_pullup(src, len);
+	if (!data) return;
+
+	/* Make a copy since we'll modify in-place */
+	uint8_t *work_data = malloc(len);
+	if (!work_data) return;
+	memcpy(work_data, data, len);
+	evbuffer_drain(src, len);
+
+	/* Decrypt */
+	if (client->use_encryption && client->decrypt_ctx) {
+		crypto_decrypt(client->decrypt_ctx, work_data, len);
+	}
+
+	/* Decompress */
+	if (client->use_compression) {
+		/* Try decompression with increasing buffer sizes */
+		size_t buf_size = len * 4;
+		uint8_t *uncomp_data = malloc(buf_size);
+		if (uncomp_data) {
+			size_t out_len = buf_size;
+			if (xfrpc_decompress(work_data, len, uncomp_data, buf_size, &out_len) == 0) {
+				evbuffer_add(dst, uncomp_data, out_len);
+				free(uncomp_data);
+				free(work_data);
+				return;
+			}
+			free(uncomp_data);
+		}
+	}
+
+	evbuffer_add(dst, work_data, len);
+	free(work_data);
+}
+
 void tcp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
 {
 	struct proxy_client *client = (struct proxy_client *)ctx;
@@ -437,6 +561,59 @@ void tcp_proxy_c2s_cb(struct bufferevent *bev, void *ctx)
 	}
 
 	struct common_conf *c_conf = get_common_config();
+
+	/* Apply encryption/compression if enabled */
+	if (client->use_encryption || client->use_compression) {
+		struct evbuffer *processed = evbuffer_new();
+		if (!processed) return;
+
+		/* First drain any encrypted leftover from a previous window
+		 * exhaustion; it must not go through crypto_encode_evbuffer()
+		 * again or the stream would be doubly encrypted. */
+		if (client->enc_pending && evbuffer_get_length(client->enc_pending) > 0)
+			evbuffer_add_buffer(processed, client->enc_pending);
+
+		crypto_encode_evbuffer(client, src, processed);
+
+		if (!c_conf->tcp_mux) {
+			struct evbuffer *dst = bufferevent_get_output(client->ctl_bev);
+			evbuffer_add_buffer(dst, processed);
+			evbuffer_free(processed);
+			return;
+		}
+
+		/* For tcp_mux, write through tmux stream */
+		while (evbuffer_get_length(processed) > 0) {
+			int written = tmux_stream_write(client->ctl_bev, processed, &client->stream);
+			if (written < 0) {
+				debug(LOG_INFO, "Stream %u: tmux_stream_write error %d",
+				      client->stream.id, written);
+				evbuffer_free(processed);
+				del_proxy_client_by_stream_id(client->stream.id);
+				return;
+			}
+			if (written == 0) {
+				/* Window exhausted - stash the ENCRYPTED remainder
+				 * aside; it will be flushed first on the next
+				 * callback instead of being re-encrypted. */
+				if (!client->enc_pending)
+					client->enc_pending = evbuffer_new();
+				if (client->enc_pending) {
+					evbuffer_add_buffer(client->enc_pending, processed);
+				} else {
+					debug(LOG_ERR, "Stream %u: failed to stash encrypted data, dropping %d bytes",
+					      client->stream.id, evbuffer_get_length(processed));
+				}
+				evbuffer_free(processed);
+				bufferevent_disable(bev, EV_READ);
+				return;
+			}
+		}
+		evbuffer_free(processed);
+		return;
+	}
+
+	/* No encryption/compression - original path */
 	if (!c_conf->tcp_mux) {
 		struct evbuffer *dst = bufferevent_get_output(client->ctl_bev);
 		evbuffer_add_buffer(dst, src);
@@ -481,6 +658,19 @@ void tcp_proxy_s2c_cb(struct bufferevent *bev, void *ctx)
 		return;
 	}
 
+	/* Apply decryption/decompression if enabled */
+	if (client->use_encryption || client->use_compression) {
+		struct evbuffer *processed = evbuffer_new();
+		if (!processed) return;
+		proxy_crypto_decode_evbuffer(client, src, processed);
+
+		struct evbuffer *dst = bufferevent_get_output(client->local_proxy_bev);
+		evbuffer_add_buffer(dst, processed);
+		evbuffer_free(processed);
+		return;
+	}
+
+	/* No encryption/decompression - original path */
 	if (!c_conf->tcp_mux) {
 		struct evbuffer *dst = bufferevent_get_output(client->local_proxy_bev);
 		evbuffer_add_buffer(dst, src);

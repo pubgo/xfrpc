@@ -26,6 +26,25 @@ struct yt_dlp_param {
 };
 
 // define yt-dlp worker function
+
+/* Shell metacharacter allowlist: the profile string is interpolated into a
+ * shell command line, so anything outside this set is rejected. */
+static int
+safe_shell_arg(const char *s)
+{
+    if (!s || !*s)
+        return 0;
+    if (strlen(s) > 200)
+        return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') ||
+              strchr(":/?&=%.~_-,@", *p)))
+            return 0;
+    }
+    return 1;
+}
+
 static void *
 yt_dlp_worker(void *param)
 {
@@ -85,7 +104,13 @@ parse_yt_dlp_command(char *json_data, struct yt_dlp_param *param)
         json_object_put(jobj);
         return -1;
     }
-    strcpy(param->action, json_object_get_string(jaction));
+    const char *action = json_object_get_string(jaction);
+    if (!action || strlen(action) >= sizeof(param->action)) {
+        debug(LOG_ERR, "yt-dlp: invalid action\n");
+        json_object_put(jobj);
+        return -1;
+    }
+    snprintf(param->action, sizeof(param->action), "%s", action);
     if (strcmp(param->action, "stop") == 0) {
         json_object_put(jobj);
         return 0;
@@ -98,7 +123,17 @@ parse_yt_dlp_command(char *json_data, struct yt_dlp_param *param)
         json_object_put(jobj);
         return -1;
     }
-    strcpy(param->profile, json_object_get_string(jprofile));
+    const char *profile = json_object_get_string(jprofile);
+    if (!safe_shell_arg(profile)) {
+        debug(LOG_ERR, "yt-dlp: invalid or unsafe profile argument\n");
+        json_object_put(jobj);
+        return -1;
+    }
+    size_t prof_len = strlen(profile);
+    if (prof_len >= sizeof(param->profile))
+        prof_len = sizeof(param->profile) - 1;
+    memcpy(param->profile, profile, prof_len);
+    param->profile[prof_len] = '\0';
 
     // free json object
     json_object_put(jobj);

@@ -10,10 +10,9 @@
 #include <assert.h>
 #include <time.h>
 #include <syslog.h>
-#include <openssl/ssl.h>
-#include <openssl/rand.h>
+#include "ssl_compat.h"
 
-#include "fastpbkdf2.h"
+
 #include "crypto.h"
 #include "config.h"
 #include "common.h"
@@ -21,6 +20,8 @@
 
 /** 
  * Default salt value used for key derivation
+ * NOTE: Must match frps golib DefaultSalt ("frp"), NOT the upstream golib v0.7.0
+ * source default ("crypto"). The frps binary uses "frp" as the PBKDF2 salt.
  */
 static const char *default_salt = "frp";
 
@@ -148,7 +149,12 @@ struct frp_coder *new_coder(const char *token, const char *salt)
 	}
 
 	encrypt_key(enc->token, strlen(enc->token), enc->salt, enc->key, block_size);
-	encrypt_iv(enc->iv, block_size);
+	if (!encrypt_iv(enc->iv, block_size)) {
+		/* never proceed with a deterministic all-zero IV */
+		debug(LOG_ERR, "Failed to generate random IV");
+		free_frp_coder(enc);
+		return NULL;
+	}
 	return enc;
 }
 
@@ -171,6 +177,7 @@ struct frp_coder *clone_coder(const struct frp_coder *coder)
 	memcpy(enc, coder, sizeof(*coder));
 	enc->token = strdup(coder->token);
 	enc->salt = strdup(coder->salt);
+	enc->iv_sent = 0;  /* fresh clone has not sent IV yet */
 
 	if (!enc->token || !enc->salt) {
 		free_frp_coder(enc);
@@ -189,13 +196,34 @@ struct frp_coder *clone_coder(const struct frp_coder *coder)
  *
  * @return Pointer to the initialized main encoder instance
  */
-struct frp_coder *init_main_encoder() 
+struct frp_coder *init_main_encoder()
 {
+	if (main_encoder) {
+		free_frp_coder(main_encoder);
+		main_encoder = NULL;
+	}
 	if (main_decoder) {
 		main_encoder = clone_coder(main_decoder);
+		if (main_encoder) {
+			/* The cloned decoder already carries the server's IV.
+			 * Reusing it for our direction would be a CFB key+IV
+			 * reuse (two-time pad), so generate a fresh IV here;
+			 * it is transmitted to the server on the first write. */
+			if (!encrypt_iv(main_encoder->iv, get_block_size())) {
+				debug(LOG_ERR, "Failed to generate encoder IV");
+				free_frp_coder(main_encoder);
+				main_encoder = NULL;
+			}
+		}
 	} else {
 		struct common_conf *c_conf = get_common_config();
 		main_encoder = new_coder(c_conf->auth_token, default_salt);
+	}
+	/* Reset persistent encryption context so it re-initializes with
+	 * the new encoder's key/IV on next encrypt_data() call. */
+	if (enc_ctx) {
+		EVP_CIPHER_CTX_free(enc_ctx);
+		enc_ctx = NULL;
 	}
 	return main_encoder;
 }
@@ -212,8 +240,26 @@ struct frp_coder *init_main_encoder()
 struct frp_coder *init_main_decoder(const uint8_t *iv)
 {
 	struct common_conf *c_conf = get_common_config();
+	if (!c_conf || !iv) {
+		debug(LOG_ERR, "init_main_decoder: invalid parameters");
+		return NULL;
+	}
+	if (main_decoder) {
+		free_frp_coder(main_decoder);
+		main_decoder = NULL;
+	}
 	main_decoder = new_coder(c_conf->auth_token, default_salt);
+	if (!main_decoder) {
+		debug(LOG_ERR, "init_main_decoder: new_coder failed");
+		return NULL;
+	}
 	memcpy(main_decoder->iv, iv, block_size);
+	/* Reset persistent decryption context so it re-initializes with
+	 * the new decoder's key/IV on next decrypt_data() call. */
+	if (dec_ctx) {
+		EVP_CIPHER_CTX_free(dec_ctx);
+		dec_ctx = NULL;
+	}
 	return main_decoder;
 }
 
@@ -288,13 +334,9 @@ unsigned char *encrypt_key(const char *token, size_t token_len, const char *salt
 		return NULL;
 	}
 
-	fastpbkdf2_hmac_sha1((void *)token, 
-						 token_len, 
-						 (void *)salt, 
-						 strlen(salt), 
-						 64,            // Number of iterations 
-						 (void *)key, 
-						 block_size);
+	PKCS5_PBKDF2_HMAC(token, (int)token_len,
+					  (const unsigned char *)salt, (int)strlen(salt),
+					  64, EVP_sha1(), (int)block_size, key);
 	return key;
 }
 
@@ -372,12 +414,16 @@ size_t encrypt_data(const uint8_t *src_data, size_t srclen,
 	// Perform encryption
 	if (!EVP_EncryptUpdate(ctx, outbuf, &tmplen, src_data, srclen)) {
 		debug(LOG_ERR, "EVP_EncryptUpdate error!");
+		free(outbuf);
+		*ret = NULL;
 		return 0;
 	}
 	outlen = tmplen;
 
 	if (!EVP_EncryptFinal_ex(ctx, outbuf + outlen, &tmplen)) {
 		debug(LOG_ERR, "EVP_EncryptFinal_ex error!");
+		free(outbuf);
+		*ret = NULL;
 		return 0;
 	}
 	outlen += tmplen;
@@ -434,12 +480,16 @@ size_t decrypt_data(const uint8_t *enc_data, size_t enclen,
 	// Perform decryption
 	if (!EVP_DecryptUpdate(ctx, outbuf, &tmplen, enc_data, enclen)) {
 		debug(LOG_ERR, "EVP_DecryptUpdate error!");
+		free(outbuf);
+		*ret = NULL;
 		return 0;
 	}
 	outlen = tmplen;
 
 	if (!EVP_DecryptFinal_ex(ctx, outbuf + outlen, &tmplen)) {
 		debug(LOG_ERR, "EVP_DecryptFinal_ex error");
+		free(outbuf);
+		*ret = NULL;
 		return 0;
 	}
 	outlen += tmplen;

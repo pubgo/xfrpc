@@ -23,7 +23,10 @@
 #include "client.h"
 #include "uthash.h"
 #include "config.h"
+#include "visitor.h"
 #include "msg.h"
+#include "xtcp_visitor.h"
+#include "xtcp_client.h"
 #include "control.h"
 #include "crypto.h"
 #include "utils.h"
@@ -32,11 +35,24 @@
 #include "tcpmux.h"
 #include "proxy.h"
 #include "tls.h"
+#include "commandline.h"
+#include "health_check.h"
+#include "quic_client_transport.h"
+#include "wire_v2.h"
+#include "aead_stream.h"
 
 static struct control *main_ctl;
 static bool xfrpc_status;
 static int is_login;
 static time_t pong_time;
+static volatile int g_reconnect_requested;
+
+static uint8_t *v2_ch_json;
+static size_t v2_ch_json_len;
+static int v2_got_hello;
+static int v2_aead_ready;
+static struct aead_writer v2_aw;
+static struct aead_reader v2_ar;
 
 static void new_work_connection(struct bufferevent *bev, struct tmux_stream *stream);
 static void recv_cb(struct bufferevent *bev, void *ctx);
@@ -44,6 +60,16 @@ static void clear_main_control(void);
 static void start_base_connect(void);
 static void keep_control_alive(void);
 static void client_start_event_cb(struct bufferevent *bev, short what, void *ctx);
+static void reload_check_timer_cb(evutil_socket_t fd, short what, void *ctx);
+static void start_proxy_services(void);
+static int prepare_message(const enum msg_type type, const char *msg,
+			   const size_t msg_len, struct msg_hdr **msg_out,
+			   size_t *total_len);
+static int prepare_login_message(char **msg_out, int *len_out);
+static void handle_control_work(const uint8_t *buf, int len, void *ctx);
+static int handle_login_response(const uint8_t *buf, int len);
+static void health_check_result_cb(struct proxy_service *ps, int healthy, void *ctx);
+static void reconnect_timer_cb(evutil_socket_t fd, short what, void *ctx);
 
 /**
  * Check if xfrpc client is connected to server
@@ -66,7 +92,6 @@ static void set_xfrpc_status(bool is_connected)
 {
 	// Set global connection status flag 
 	xfrpc_status = is_connected;
-	debug(LOG_DEBUG, "xfrpc connection status set to: %s", is_connected ? "connected" : "disconnected");
 }
 
 /**
@@ -140,8 +165,14 @@ static void handle_client_connected(struct proxy_client *client, struct bufferev
 	bufferevent_setcb(bev, recv_cb, NULL, client_start_event_cb, client);
 	bufferevent_enable(bev, EV_READ|EV_WRITE);
 
-	// Initialize work connection
-	new_work_connection(bev, &main_ctl->stream);
+	struct common_conf *c_conf = get_common_config();
+
+	// Initialize work connection — use raw framing when tcp_mux is off
+	if (c_conf && c_conf->tcp_mux) {
+		new_work_connection(bev, &main_ctl->stream);
+	} else {
+		new_work_connection(bev, NULL);
+	}
 	set_xfrpc_status(true);
 
 	debug(LOG_INFO, "Proxy service started successfully");
@@ -250,6 +281,17 @@ static int init_direct_client(struct proxy_client *client,
 
 	client->ctl_bev = bev;
 	bufferevent_enable(bev, EV_WRITE);
+
+	/* For QUIC transport, connect_server() returns an already-connected
+	 * bufferevent (handshake done synchronously). BEV_EVENT_CONNECTED will
+	 * NOT fire, so we must handle the connected state immediately. */
+	struct common_conf *c_conf = get_common_config();
+	if (c_conf && c_conf->protocol && strcmp(c_conf->protocol, "quic") == 0) {
+		debug(LOG_INFO, "Work conn via QUIC — already connected");
+		handle_client_connected(client, bev);
+		return 0;
+	}
+
 	bufferevent_setcb(bev, NULL, NULL, client_start_event_cb, client);
 	
 	return 0;
@@ -285,7 +327,7 @@ static void new_client_connect()
 	struct common_conf *c_conf = get_common_config();
 	if (!c_conf) {
 		debug(LOG_ERR, "Failed to get common config");
-		free(client);
+		del_proxy_client_by_stream_id(client->stream_id);
 		return;
 	}
 
@@ -293,7 +335,7 @@ static void new_client_connect()
 	client->base = main_ctl->connect_base;
 	if (!client->base) {
 		debug(LOG_ERR, "Invalid event base");
-		free(client);
+		del_proxy_client_by_stream_id(client->stream_id);
 		return;
 	}
 
@@ -301,12 +343,12 @@ static void new_client_connect()
 	if (c_conf->tcp_mux) {
 		client->ctl_bev = main_ctl->connect_bev;
 		if (init_tcp_mux_client(client) != 0) {
-			free(client);
+			del_proxy_client_by_stream_id(client->stream_id);
 			return;
 		}
 	} else {
 		if (init_direct_client(client, c_conf->server_addr, c_conf->server_port) != 0) {
-			free(client);
+			del_proxy_client_by_stream_id(client->stream_id);
 			return;
 		}
 	}
@@ -329,6 +371,9 @@ static void new_client_connect()
  */
 static void start_proxy_services() 
 {
+	/* Start visitor listeners first — visitors work independently of proxy services */
+	init_visitors(get_main_control()->connect_base);
+
 	// Get configured proxy services
 	struct proxy_service *all_ps = get_all_proxy_services();
 	if (!all_ps) {
@@ -353,9 +398,21 @@ static void start_proxy_services()
 			continue;
 		}
 
+		// Skip unhealthy proxies (health check configured but failing)
+		if (ps->health_check_type && !health_check_is_healthy(ps->proxy_name)) {
+			debug(LOG_INFO, "Skipping unhealthy proxy: %s", ps->proxy_name);
+			continue;
+		}
+
 		// Send new proxy request
 		debug(LOG_DEBUG, "Sending proxy service: %s", ps->proxy_name);
 		send_new_proxy(ps);
+	}
+
+	/* Start health checks for proxy services that have it configured */
+	struct event_base *base = get_main_control()->connect_base;
+	if (base) {
+		health_check_start_all(base, health_check_result_cb, NULL);
 	}
 }
 
@@ -445,11 +502,34 @@ static void new_work_connection(struct bufferevent *bev, struct tmux_stream *str
 
 	// Send work connection request
 	debug(LOG_DEBUG, "Sending new work connection request: length=%d", msg_len);
-	send_msg_frp_server(bev, TypeNewWorkConn, work_conn_msg, msg_len, stream);
 
-	// Cleanup
-	SAFE_FREE(work_conn_msg);
-	SAFE_FREE(work_c);
+	/* For QUIC work streams, send the initial NewWorkConn synchronously
+	 * on the QUIC wire so frps sees data before it can FIN the stream.
+	 * The bev/socketpair path is used for subsequent data relay. */
+#ifdef HAVE_NGTCP2
+        {
+                struct common_conf *qconf = get_common_config();
+                if (qconf && qconf->protocol && strcmp(qconf->protocol, "quic") == 0
+                    && bev != main_ctl->connect_bev) {
+                        struct msg_hdr *qmsg = NULL;
+                        size_t qtotal = 0;
+                        if (prepare_message(TypeNewWorkConn, work_conn_msg, msg_len,
+                                            &qmsg, &qtotal) == 0) {
+                                if (quic_work_stream_send_initial(qmsg, qtotal) < 0)
+                                        debug(LOG_ERR, "QUIC initial work conn send failed");
+                                free(qmsg);
+                                goto work_conn_cleanup;
+                        }
+                }
+        }
+#endif
+        send_msg_frp_server(bev, TypeNewWorkConn, work_conn_msg, msg_len, stream);
+
+#ifdef HAVE_NGTCP2
+	work_conn_cleanup:
+#endif
+        SAFE_FREE(work_conn_msg);
+        SAFE_FREE(work_c);
 }
 
 /**
@@ -482,6 +562,14 @@ struct bufferevent *connect_server(struct event_base *base, const char *name, co
 		debug(LOG_ERR, "Invalid connection parameters: base=%p, name=%s, port=%d",
 			  base, name ? name : "NULL", port);
 		return NULL;
+	}
+
+	// If QUIC protocol and target is frps, use QUIC for work connections
+	struct common_conf *c_conf = get_common_config();
+	if (c_conf && c_conf->protocol && strcmp(c_conf->protocol, "quic") == 0 &&
+	    strcmp(name, c_conf->server_addr) == 0 && port == c_conf->server_port) {
+		debug(LOG_INFO, "Work conn via QUIC stream to %s:%d", name, port);
+		return quic_open_work_stream(base);
 	}
 
 	// Create new bufferevent socket
@@ -664,7 +752,9 @@ static void check_server_timeout(time_t current_time) {
 
 		reset_session_id();
 		clear_main_control();
-		run_control();
+		g_reconnect_requested = 1;
+		if (main_ctl && main_ctl->connect_base)
+			event_base_loopbreak(main_ctl->connect_base);
 	}
 }
 
@@ -701,39 +791,6 @@ static void heartbeat_handler(evutil_socket_t fd, short event, void *arg) {
 	}
 
 	check_server_timeout(current_time);
-}
-
-/**
- * Handles configuration for FTP proxy service by updating the remote data port
- * of the main FTP proxy service.
- *
- * @param ps The proxy service containing FTP configuration
- * @param npr The new proxy response containing remote port information
- *
- * @return 1 on successful configuration, 0 if main service not found or invalid port
- *
- * This function:
- * 1. Looks up the main FTP proxy service using the configuration proxy name
- * 2. Validates the remote port from the new proxy response
- * 3. Updates the main service's remote data port if validation succeeds
- */
-static int handle_ftp_configuration(struct proxy_service *ps, struct new_proxy_response *npr) 
-{
-	struct proxy_service *main_ps = get_proxy_service(ps->ftp_cfg_proxy_name);
-	if (!main_ps) {
-		debug(LOG_ERR, "Main FTP proxy service '%s' not found", ps->ftp_cfg_proxy_name);
-		return 0;
-	}
-
-	debug(LOG_DEBUG, "Found main FTP proxy service '%s'", main_ps->proxy_name);
-
-	if (npr->remote_port <= 0) {
-		debug(LOG_ERR, "Invalid FTP remote data port: %d", npr->remote_port);
-		return 0;
-	}
-
-	main_ps->remote_data_port = npr->remote_port;
-	return 1;
 }
 
 /**
@@ -774,13 +831,6 @@ static int proxy_service_resp_raw(struct new_proxy_response *npr)
 	if (!ps->proxy_type) {
 		debug(LOG_ERR, "Proxy type is NULL for service '%s'", npr->proxy_name);
 		return 1;
-	}
-
-	// Handle FTP configuration if present
-	if (ps->ftp_cfg_proxy_name) {
-		if (!handle_ftp_configuration(ps, npr)) {
-			return 1;
-		}
 	}
 
 	return 0;
@@ -837,7 +887,7 @@ static int handle_enc_msg(const uint8_t *enc_msg, int ilen, uint8_t **out)
 	size_t dec_len = decrypt_data(buf, remaining_len, get_main_decoder(), &dec_msg);
 	
 	if (dec_len <= 0 || !dec_msg) {
-		debug(LOG_ERR, "Decryption failed");
+		debug(LOG_ERR, "Decryption failed: dec_len=%zu, dec_msg=%p", dec_len, dec_msg);
 		return -1;
 	}
 
@@ -858,6 +908,8 @@ static int handle_enc_msg(const uint8_t *enc_msg, int ilen, uint8_t **out)
  */
 static void handle_type_req_work_conn(void *ctx)
 {
+	debug(LOG_DEBUG, "[REQ_WORK_CONN] Received TypeReqWorkConn, is_xfrpc_connected=%d",
+	      is_xfrpc_connected());
 	if (!is_xfrpc_connected()) {
 		start_proxy_services();
 		set_xfrpc_status(true);
@@ -877,7 +929,14 @@ static void handle_type_req_work_conn(void *ctx)
  */
 static void handle_type_new_proxy_resp(struct msg_hdr *msg)
 {
-	struct new_proxy_response *npr = new_proxy_resp_unmarshal((const char *)msg->data);
+	int data_len = (int)msg_hton(msg->length);
+	char *json_str = malloc(data_len + 1);
+	if (!json_str) return;
+	memcpy(json_str, msg->data, data_len);
+	json_str[data_len] = '\0';
+
+	struct new_proxy_response *npr = new_proxy_resp_unmarshal(json_str);
+	free(json_str);
 	if (!npr) {
 		debug(LOG_ERR, "Failed to unmarshal new proxy response");
 		return;
@@ -929,7 +988,21 @@ static int is_service_available(struct proxy_service *ps)
  */
 static void handle_type_start_work_conn(struct msg_hdr *msg, int len, void *ctx)
 {
-    struct start_work_conn_resp *sr = start_work_conn_resp_unmarshal((const char *)msg->data);
+    debug(LOG_DEBUG, "[START_WORK_CONN] Received TypeStartWorkConn, data_len=%d",
+          msg_hton(msg->length));
+
+int data_len = (int)msg_hton(msg->length);
+	debug(LOG_DEBUG, "[START_WORK_CONN] Raw data: %.*s",
+          data_len, msg->data);
+
+	/* null-terminate before passing to json_tokener_parse (same fix as login) */
+	char *json_str = malloc(data_len + 1);
+	if (!json_str) return;
+	memcpy(json_str, msg->data, data_len);
+	json_str[data_len] = '\0';
+
+	struct start_work_conn_resp *sr = start_work_conn_resp_unmarshal(json_str);
+	free(json_str);
     if (!sr) {
         debug(LOG_ERR, "Failed to unmarshal TypeStartWorkConn");
         return;
@@ -974,6 +1047,15 @@ static void handle_type_start_work_conn(struct msg_hdr *msg, int len, void *ctx)
         debug(LOG_DEBUG, "Data tail copied (%d bytes)", remaining_len);
     }
 
+    /* Route XTCP proxies to dedicated NAT hole-punch handler */
+    if (ps->proxy_type && strcmp(ps->proxy_type, "xtcp") == 0) {
+        debug(LOG_INFO, "[START_WORK_CONN] XTCP proxy '%s' detected, starting NAT hole-punch",
+              sr->proxy_name);
+        xtcp_client_run(client->base, client);
+        SAFE_FREE(sr);
+        return;
+    }
+
     start_xfrp_tunnel(client);
     set_client_work_start(client, 1);
     SAFE_FREE(sr);
@@ -991,7 +1073,14 @@ static void handle_type_start_work_conn(struct msg_hdr *msg, int len, void *ctx)
  */
 static void handle_type_udp_packet(struct msg_hdr *msg, void *ctx)
 {
-	struct udp_packet *udp = udp_packet_unmarshal((const char *)msg->data);
+	int data_len = (int)msg_hton(msg->length);
+	char *json_str = malloc(data_len + 1);
+	if (!json_str) return;
+	memcpy(json_str, msg->data, data_len);
+	json_str[data_len] = '\0';
+
+	struct udp_packet *udp = udp_packet_unmarshal(json_str);
+	free(json_str);
 	if (!udp) {
 		debug(LOG_ERR, "Failed to unmarshal TypeUDPPacket");
 		return;
@@ -1015,6 +1104,23 @@ static void handle_type_udp_packet(struct msg_hdr *msg, void *ctx)
 }
 
 /**
+ * @brief Creates a null-terminated copy of msg->data for JSON parsing.
+ *
+ * msg->data points into an evbuffer (or decrypted buffer) and is NOT
+ * null-terminated.  json_tokener_parse requires a C string.
+ * The caller must free() the returned pointer.
+ */
+static char *msg_data_to_json(const struct msg_hdr *msg)
+{
+	int data_len = (int)msg_hton(msg->length);
+	char *json_str = malloc(data_len + 1);
+	if (!json_str) return NULL;
+	memcpy(json_str, msg->data, data_len);
+	json_str[data_len] = '\0';
+	return json_str;
+}
+
+/**
  * @brief Handles the control work based on received buffer data
  *
  * Processes control messages received in the buffer and performs
@@ -1027,16 +1133,32 @@ static void handle_type_udp_packet(struct msg_hdr *msg, void *ctx)
 static void handle_control_work(const uint8_t *buf, int len, void *ctx)
 {
 	uint8_t *frps_cmd = NULL;
+	int flen = 0;
 
-	if (!ctx) {
-		if (handle_enc_msg(buf, len, &frps_cmd) <= 0 || !frps_cmd) {
+	if (!ctx && !wire_protocol_is_v2()) {
+		int dlen = handle_enc_msg(buf, len, &frps_cmd);
+		if (dlen <= 0 || !frps_cmd) {
 			return;
 		}
+		flen = dlen;
 	} else {
 		frps_cmd = (uint8_t *)buf;
+		flen = len;
 	}
 
 	struct msg_hdr *msg = (struct msg_hdr *)frps_cmd;
+
+	/* The length field is server-controlled: never let it drive a
+	 * memcpy() past the received buffer. */
+	if (flen < (int)sizeof(struct msg_hdr) ||
+	    (int)msg_hton(msg->length) > flen - (int)sizeof(struct msg_hdr)) {
+		debug(LOG_ERR, "Invalid message length %d (buffer %d), dropping",
+		      (int)msg_hton(msg->length), flen);
+		if (!ctx)
+			free(frps_cmd);
+		return;
+	}
+
 	uint8_t cmd_type = msg->type;
 
 	switch (cmd_type) {
@@ -1047,10 +1169,36 @@ static void handle_control_work(const uint8_t *buf, int len, void *ctx)
 		handle_type_new_proxy_resp(msg);
 		break;
 	case TypeStartWorkConn:
-		handle_type_start_work_conn(msg, len, ctx);
+		/* flen is the decrypted buffer size (or the plaintext size when
+		 * unencrypted); the header/length arithmetic inside must use it. */
+		handle_type_start_work_conn(msg, flen, ctx);
 		break;
 	case TypeUDPPacket:
 		handle_type_udp_packet(msg, ctx);
+		break;
+	case TypeNewVisitorConnResp: {
+		char *json = msg_data_to_json(msg);
+		if (json) {
+			handle_visitor_conn_resp(json, (struct proxy_client *)ctx);
+			free(json);
+		}
+		break;
+	}
+	case TypeNatHoleResp: {
+		/* Handle XTCP NAT hole-punch response (visitor or client) */
+		debug(LOG_DEBUG, "[CTRL_WORK] NatHoleResp received");
+		char *json = msg_data_to_json(msg);
+		if (json) {
+			if (!xtcp_client_handle_nat_hole_resp(json)) {
+				xtcp_handle_nat_hole_resp_msg(json);
+			}
+			free(json);
+		}
+		break;
+	}
+	case TypeNatHoleReport:
+		/* NatHoleReport acknowledgment - no action needed */
+		debug(LOG_DEBUG, "[CTRL_WORK] NatHoleReport ack received");
 		break;
 	case TypePong:
 		pong_time = time(NULL);
@@ -1080,7 +1228,20 @@ static int validate_login_msg(const struct msg_hdr *mhdr) {
  * @return Returns status code: 0 on success, negative value on failure
  */
 static int process_login_response(const struct msg_hdr *mhdr) {
-	struct login_resp *lres = login_resp_unmarshal((const char *)mhdr->data);
+	/* mhdr->data points into an evbuffer and is NOT null-terminated.
+	 * json_tokener_parse requires a C string, so we must copy and
+	 * null-terminate before passing it. */
+	int data_len = (int)msg_hton(mhdr->length);
+	char *json_str = malloc(data_len + 1);
+	if (!json_str) {
+		debug(LOG_ERR, "Failed to allocate login response buffer");
+		return 0;
+	}
+	memcpy(json_str, mhdr->data, data_len);
+	json_str[data_len] = '\0';
+
+	struct login_resp *lres = login_resp_unmarshal(json_str);
+	free(json_str);
 	if (!lres) {
 		debug(LOG_ERR, "Failed to unmarshal login response");
 		return 0;
@@ -1096,46 +1257,6 @@ static int process_login_response(const struct msg_hdr *mhdr) {
 
 	return 1;
 }
-
-/**
- * @brief Handles any remaining data after processing the message header
- * 
- * Processes remaining data from a message after the header has been handled.
- * 
- * @param mhdr Pointer to the message header structure
- * @param login_len Length of the login data
- * @param ilen Input length of the data
- * 
- * @note This function assumes the message header has already been validated
- */
-static void handle_remaining_data(struct msg_hdr *mhdr, int login_len, int ilen) {
-	struct common_conf *c_conf = get_common_config();
-	if (!c_conf || c_conf->tcp_mux) {
-		return;
-	}
-
-	uint8_t *enc_msg = mhdr->data + login_len;
-	uint8_t *frps_cmd = NULL;
-	
-	int nret = handle_enc_msg(enc_msg, ilen, &frps_cmd);
-	if (nret <= 0 || !frps_cmd) {
-		debug(LOG_ERR, "Failed to handle encrypted message");
-		return;
-	}
-
-	if (frps_cmd[0] != TypeReqWorkConn) {
-		debug(LOG_ERR, "Unexpected message type: %d", frps_cmd[0]);
-		free(frps_cmd);
-		return;
-	}
-
-	start_proxy_services();
-	set_xfrpc_status(true);
-	new_client_connect();
-	
-	free(frps_cmd);
-}
-
 
 /**
  * @brief Handles the response received after a login attempt
@@ -1168,16 +1289,26 @@ static int handle_login_response(const uint8_t *buf, int len)
 	is_login = 1;
 	
 	int login_len = msg_hton(mhdr->length);
-	int remaining_len = len - login_len - sizeof(struct msg_hdr);
+	int consumed = login_len + sizeof(struct msg_hdr);
+	int remaining_len = len - consumed;
 	
-	debug(LOG_INFO, "Login successful - message length: %d, total length: %d, remaining: %d", 
-		  login_len, len, remaining_len);
+	debug(LOG_INFO, "Login successful - message length: %d, total length: %d, consumed: %d, remaining: %d", 
+		  login_len, len, consumed, remaining_len);
 
+	/* Don't process remaining bytes here — they belong to the encrypted
+	 * control channel (IV + encrypted ReqWorkConn etc.) that frps starts
+	 * writing immediately after LoginResp.  Leave them in the evbuffer
+	 * so the next recv_cb picks them up through the normal
+	 * handle_control_work -> handle_enc_msg path. */
 	if (remaining_len > 0) {
-		handle_remaining_data(mhdr, login_len, remaining_len);
+		debug(LOG_DEBUG, "[LOGIN] %d remaining bytes left in buffer for encrypted channel",
+		      remaining_len);
 	}
 
-	return 1;
+	/* Return only the bytes consumed (LoginResp portion).
+	 * The caller (handle_non_mux) will drain only this many bytes
+	 * from the evbuffer, preserving any trailing encrypted data. */
+	return consumed;
 }
 
 /**
@@ -1190,24 +1321,176 @@ static int handle_login_response(const uint8_t *buf, int len)
  * @details This function processes incoming messages from the frps (frp server)
  *          and performs appropriate handling based on the message content
  */
+static int v2_buf_append(uint8_t **buf, size_t *len, size_t *cap,
+			 const uint8_t *p, size_t n)
+{
+	if (*len + n > *cap) {
+		size_t capn = *cap ? *cap * 2 : 4096;
+		while (capn < *len + n)
+			capn *= 2;
+		uint8_t *nb = realloc(*buf, capn);
+		if (!nb)
+			return -1;
+		*buf = nb;
+		*cap = capn;
+	}
+	memcpy(*buf + *len, p, n);
+	*len += n;
+	return 0;
+}
+
+static int v2_init_aead_from_hello(const uint8_t *sh_json, size_t sh_len)
+{
+	char alg[64] = {0};
+	char err[256] = {0};
+	if (wire_v2_parse_server_hello_json(sh_json, sh_len, alg, sizeof(alg),
+					    err, sizeof(err)) != 0) {
+		debug(LOG_ERR, "v2 ServerHello rejected: %s", err[0] ? err : "parse error");
+		return -1;
+	}
+	uint8_t transcript[32];
+	wire_v2_hash_transcript(v2_ch_json, v2_ch_json_len, sh_json, sh_len, transcript);
+
+	struct common_conf *c = get_common_config();
+	const char *token = c->auth_token ? c->auth_token : "";
+	uint8_t c2s[AEAD_KEY_SIZE], s2c[AEAD_KEY_SIZE];
+	if (derive_v2_control_keys((const uint8_t *)token, strlen(token),
+				   transcript, alg, c2s, s2c) != 0)
+		return -1;
+	if (aead_writer_init(&v2_aw, c2s) != 0)
+		return -1;
+	if (aead_reader_init(&v2_ar, s2c) != 0)
+		return -1;
+	v2_got_hello = 1;
+	debug(LOG_INFO, "Wire v2 ServerHello ok, AEAD %s", alg);
+	return 0;
+}
+
+static void v2_dispatch_v1_buf(uint8_t *v1, size_t v1_len, void *ctx)
+{
+	if (!is_login) {
+		handle_login_response(v1, (int)v1_len);
+		free(v1);
+	} else {
+		handle_control_work(v1, (int)v1_len, ctx);
+		if (ctx)
+			free(v1);
+	}
+}
+
+static void v2_consume_plain_frames(struct tmux_stream *st, void *ctx)
+{
+	while (st->v2_rx_len >= 8) {
+		uint16_t type = 0;
+		const uint8_t *pl = NULL;
+		uint32_t plen = 0;
+		int n = wire_v2_parse_frame(st->v2_rx, st->v2_rx_len, &type, &pl, &plen);
+		if (n == 0)
+			return;
+		if (n < 0) {
+			st->v2_rx_len = 0;
+			return;
+		}
+		if (!v2_got_hello && !ctx) {
+			if (type != WIRE_V2_FRAME_SERVER_HELLO) {
+				debug(LOG_ERR, "v2 expected ServerHello, got type %u", type);
+				memmove(st->v2_rx, st->v2_rx + n, st->v2_rx_len - (size_t)n);
+				st->v2_rx_len -= (size_t)n;
+				return;
+			}
+			if (v2_init_aead_from_hello(pl, plen) != 0) {
+				memmove(st->v2_rx, st->v2_rx + n, st->v2_rx_len - (size_t)n);
+				st->v2_rx_len -= (size_t)n;
+				return;
+			}
+		} else if (type == WIRE_V2_FRAME_MESSAGE) {
+			uint8_t *v1 = NULL;
+			size_t v1_len = 0;
+			if (wire_v2_payload_to_v1(pl, plen, &v1, &v1_len) == 0)
+				v2_dispatch_v1_buf(v1, v1_len, ctx);
+		} else {
+			debug(LOG_ERR, "v2 unexpected frame type %u", type);
+		}
+		memmove(st->v2_rx, st->v2_rx + n, st->v2_rx_len - (size_t)n);
+		st->v2_rx_len -= (size_t)n;
+
+		if (!ctx && is_login && v2_got_hello && !v2_aead_ready) {
+			v2_aead_ready = 1;
+			if (st->v2_rx_len) {
+				if (aead_reader_feed(&v2_ar, st->v2_rx, st->v2_rx_len) == 0 &&
+				    v2_ar.pt_len > 0) {
+					size_t pt_len = v2_ar.pt_len;
+					uint8_t *pt = malloc(pt_len);
+					if (pt) {
+						memcpy(pt, v2_ar.pt_buf, pt_len);
+						v2_ar.pt_len = 0;
+						st->v2_rx_len = 0;
+						v2_buf_append(&st->v2_rx, &st->v2_rx_len, &st->v2_rx_cap,
+							      pt, pt_len);
+						free(pt);
+						v2_consume_plain_frames(st, ctx);
+						return;
+					}
+				}
+				st->v2_rx_len = 0;
+			}
+			return;
+		}
+	}
+}
+
+static void v2_handle_bytes(uint8_t *buf, int len, void *ctx)
+{
+	struct tmux_stream *st = ctx ? &((struct proxy_client *)ctx)->stream
+				     : &main_ctl->stream;
+	if (!st)
+		return;
+
+	const uint8_t *p = buf;
+	int left = len;
+	if (!st->v2_magic_seen && left >= WIRE_V2_MAGIC_LEN &&
+	    memcmp(p, WIRE_V2_MAGIC, WIRE_V2_MAGIC_LEN) == 0) {
+		p += WIRE_V2_MAGIC_LEN;
+		left -= WIRE_V2_MAGIC_LEN;
+		st->v2_magic_seen = 1;
+	}
+
+	if (v2_aead_ready && !ctx) {
+		if (aead_reader_feed(&v2_ar, p, (size_t)left) != 0)
+			return;
+		if (v2_ar.pt_len) {
+			if (v2_buf_append(&st->v2_rx, &st->v2_rx_len, &st->v2_rx_cap,
+					  v2_ar.pt_buf, v2_ar.pt_len) != 0)
+				return;
+			v2_ar.pt_len = 0;
+			v2_consume_plain_frames(st, ctx);
+		}
+		return;
+	}
+
+	if (v2_buf_append(&st->v2_rx, &st->v2_rx_len, &st->v2_rx_cap, p, (size_t)left) != 0)
+		return;
+	v2_consume_plain_frames(st, ctx);
+}
+
 static void handle_frps_msg(uint8_t *buf, int len, void *ctx) 
 {
-	// Validate input parameters
 	if (!buf || len <= 0) {
 		debug(LOG_ERR, "Invalid message buffer or length");
 		return;
 	}
 
-	// Handle message based on login state
+	if (wire_protocol_is_v2()) {
+		v2_handle_bytes(buf, len, ctx);
+		return;
+	}
+
 	if (!is_login) {
-		// Handle login response first
 		if (!handle_login_response(buf, len)) {
 			debug(LOG_ERR, "Login response handling failed");
 			return;
 		}
 	} else {
-		// Handle control messages after successful login
-		debug(LOG_DEBUG, "Processing control message: length=%d", len);
 		handle_control_work(buf, len, ctx);
 	}
 }
@@ -1232,6 +1515,15 @@ static void handle_tcp_mux(struct bufferevent *bev, int len, void *ctx)
 	static struct tcp_mux_header tmux_hdr;
 	static uint32_t stream_len = 0;
 	static uint8_t partial_header = 0;  /* bytes of header accumulated so far */
+
+	/* Allow explicit reset by passing NULL bev */
+	if (!bev) {
+		memset(&tmux_hdr, 0, sizeof(tmux_hdr));
+		stream_len = 0;
+		partial_header = 0;
+		set_cur_stream(NULL);
+		return;
+	}
 
 	while (len > 0) {
 		struct tmux_stream *cur = get_cur_stream();
@@ -1275,11 +1567,13 @@ static void handle_tcp_mux(struct bufferevent *bev, int len, void *ctx)
 				break;
 			}
 
-			if (tmux_hdr.type == DATA) {
+			if (tmux_hdr.type == TMUX_DATA) {
 				uint32_t stream_id = ntohl(tmux_hdr.stream_id);
 				stream_len = ntohl(tmux_hdr.length);
+				debug(LOG_DEBUG, "[TMUX] TMUX_DATA frame: stream=%u, payload=%u, buf_remain=%d",
+				      stream_id, stream_len, len);
 				if (stream_len > MAX_STREAM_WINDOW_SIZE) {
-					debug(LOG_ERR, "Stream %u: DATA length %u exceeds maximum %u, aborting",
+					debug(LOG_ERR, "Stream %u: TMUX_DATA length %u exceeds maximum %u, aborting",
 					      stream_id, stream_len, MAX_STREAM_WINDOW_SIZE);
 					break;
 				}
@@ -1300,8 +1594,8 @@ static void handle_tcp_mux(struct bufferevent *bev, int len, void *ctx)
 			}
 		}
 
-		/* ---- Payload consumption (DATA type only) ---- */
-		if (tmux_hdr.type == DATA && stream_len > 0) {
+		/* ---- Payload consumption (TMUX_DATA type only) ---- */
+		if (tmux_hdr.type == TMUX_DATA && stream_len > 0) {
 			uint32_t to_read = (uint32_t)len < stream_len ? (uint32_t)len : stream_len;
 
 			if (cur == &abandon_stream) {
@@ -1320,16 +1614,21 @@ static void handle_tcp_mux(struct bufferevent *bev, int len, void *ctx)
 			if (to_read < stream_len) {
 				debug(LOG_DEBUG, "Stream %u: partial frame %u/%u, waiting",
 				      cur->id, to_read, stream_len);
+				set_cur_stream(cur);
 				break;
 			}
 
 			/* Full frame available: read payload and dispatch */
 			uint16_t flags = ntohs(tmux_hdr.flags);
 			struct proxy_client *pc = get_proxy_client(cur->id);
+			debug(LOG_DEBUG, "[TMUX] Dispatching stream=%u, len=%u, flags=0x%x, pc=%p",
+			      cur->id, stream_len, flags, (void *)pc);
 			process_data(bev, cur, stream_len, flags, handle_frps_msg, (void *)pc);
 			len -= stream_len;
 			stream_len = 0;
 		} else if (tmux_hdr.type == WINDOW_UPDATE) {
+			debug(LOG_DEBUG, "[TMUX] WINDOW_UPDATE: stream=%u",
+			      ntohl(tmux_hdr.stream_id));
 			handle_tcp_mux_stream(&tmux_hdr, handle_frps_msg);
 		} else if (tmux_hdr.type == PING) {
 			handle_tcp_mux_ping(&tmux_hdr);
@@ -1363,17 +1662,69 @@ static void handle_non_mux(struct bufferevent *bev, struct evbuffer *input, int 
 	struct evbuffer_iovec iov;
 	int n = evbuffer_peek(input, len, NULL, &iov, 1);
 	if (n >= 1 && (int)iov.iov_len >= len) {
+		/* Before login, the buffer may contain LoginResp followed by
+		 * encrypted control-channel data (IV + ReqWorkConn).  The
+		 * LoginResp is sent unencrypted by frps through the original
+		 * connection, while subsequent data flows through the crypto
+		 * wrapper.  We must only drain the LoginResp bytes so the
+		 * encrypted tail stays in the evbuffer for the next recv_cb,
+		 * where it will be handled through handle_enc_msg. */
+		int drain_len = len;
+		if (!is_login && len > (int)sizeof(struct msg_hdr)) {
+			struct msg_hdr *mhdr = (struct msg_hdr *)iov.iov_base;
+			if (mhdr->type == TypeLoginResp) {
+				int msg_data_len = (int)msg_hton(mhdr->length);
+				int login_total = msg_data_len + (int)sizeof(struct msg_hdr);
+				if (login_total > 0 && login_total <= len) {
+					drain_len = login_total;
+					debug(LOG_DEBUG, "[NON_MUX] LoginResp: draining %d of %d bytes, "
+					      "leaving %d for encrypted channel",
+					      drain_len, len, len - drain_len);
+				}
+			}
+		}
 		handle_frps_msg((uint8_t *)iov.iov_base, len, ctx);
-		evbuffer_drain(input, len);
+		evbuffer_drain(input, drain_len);
 	} else {
 		/* Fallback: data spans multiple chunks, copy to contiguous buffer */
 		uint8_t *buf = malloc(len);
 		assert(buf);
 		evbuffer_remove(input, buf, len);
+
+		int drain_len = len;
+		if (!is_login && len > (int)sizeof(struct msg_hdr)) {
+			struct msg_hdr *mhdr = (struct msg_hdr *)buf;
+			if (mhdr->type == TypeLoginResp) {
+				int msg_data_len = (int)msg_hton(mhdr->length);
+				int login_total = msg_data_len + (int)sizeof(struct msg_hdr);
+				if (login_total > 0 && login_total <= len) {
+					drain_len = login_total;
+					debug(LOG_DEBUG, "[NON_MUX] LoginResp fallback: draining %d of %d bytes",
+					      drain_len, len);
+				}
+			}
+		}
 		handle_frps_msg(buf, len, ctx);
+
+		if (drain_len < len) {
+			/* Put back unconsumed encrypted bytes */
+			evbuffer_prepend(input, buf + drain_len, len - drain_len);
+		}
 		free(buf);
 	}
 }
+
+/*
+ * NOTE: After LoginResp is consumed, subsequent encrypted control data
+ * (IV + AES-CFB ciphertext) may arrive in the same recv_cb.  In QUIC mode
+ * the frps Writer sends IV(16) + ciphertext in two writes that the QUIC
+ * stream may coalesce.  The ciphertext may span multiple QUIC STREAM
+ * frames, so handle_enc_msg may only get a partial message on the first
+ * pass.  The recv_cb loop re-invokes handle_non_mux once after login
+ * succeeds so the buffered IV+data is picked up; if the message is still
+ * incomplete the data stays in the evbuffer (decoder state is preserved)
+ * and the next recv_cb continues decryption.
+ */
 
 /**
  * @brief Callback function for handling received data from a bufferevent
@@ -1386,19 +1737,49 @@ static void handle_non_mux(struct bufferevent *bev, struct evbuffer *input, int 
  */
 static void recv_cb(struct bufferevent *bev, void *ctx)
 {
-	struct evbuffer *input = bufferevent_get_input(bev);
-	int len = evbuffer_get_length(input);
-	if (len <= 0) {
-		return;
-	}
-
 	struct common_conf *c_conf = get_common_config();
 
 	if (c_conf->tcp_mux) {
-		handle_tcp_mux(bev, len, ctx);
+		struct evbuffer *input = bufferevent_get_input(bev);
+		int len = evbuffer_get_length(input);
+		if (len > 0)
+			handle_tcp_mux(bev, len, ctx);
 	} else {
-		handle_non_mux(bev, input, len, ctx);
+		/* Loop to handle the transition from LoginResp to encrypted
+		 * control channel: after draining LoginResp, remaining bytes
+		 * (IV + encrypted ReqWorkConn) must be processed in the same
+		 * event-loop iteration so the proxy startup is not deferred
+		 * until the next network event. */
+		int prev_login;
+		do {
+			prev_login = is_login;
+			struct evbuffer *input = bufferevent_get_input(bev);
+			int len = evbuffer_get_length(input);
+			if (len <= 0) break;
+			handle_non_mux(bev, input, len, ctx);
+		} while (!prev_login && is_login &&
+		         evbuffer_get_length(bufferevent_get_input(bev)) > 0);
 	}
+}
+
+/**
+ * @brief Timer callback for deferred reconnection after connection failure.
+ *
+ * This callback runs outside the bufferevent callback stack, avoiding
+ * use-after-free issues from destroying a bufferevent inside its own callback.
+ */
+static void reconnect_timer_cb(evutil_socket_t fd, short what, void *ctx)
+{
+	(void)fd; (void)what; (void)ctx;
+	debug(LOG_INFO, "Reconnecting after delay...");
+	reset_session_id();
+	clear_main_control();
+	/* Break the current event loop instead of calling run_control()
+	 * reentrantly — run_control() will re-enter event_base_dispatch
+	 * after the loop exits. */
+	g_reconnect_requested = 1;
+	if (main_ctl && main_ctl->connect_base)
+		event_base_loopbreak(main_ctl->connect_base);
 }
 
 /**
@@ -1423,11 +1804,22 @@ static void handle_connection_failure(struct common_conf *c_conf, int *retry_tim
 		debug(LOG_INFO, "Maximum retry attempts (%d) reached", MAX_RETRY_TIMES);
 	}
 
-	sleep(RETRY_DELAY_SECONDS);
-	
-	reset_session_id();
-	clear_main_control();
-	run_control();
+	/* Use an async timer instead of blocking sleep().
+	 * This keeps the event loop responsive during the delay and avoids
+	 * destroying the current bufferevent from within its own callback. */
+	main_ctl->reconnect_timer = evtimer_new(main_ctl->connect_base,
+			reconnect_timer_cb, NULL);
+	if (main_ctl->reconnect_timer) {
+		struct timeval tv = {RETRY_DELAY_SECONDS, 0};
+		evtimer_add(main_ctl->reconnect_timer, &tv);
+	} else {
+		debug(LOG_ERR, "Failed to create reconnect timer, falling back to immediate retry");
+		reset_session_id();
+		clear_main_control();
+		g_reconnect_requested = 1;
+		if (main_ctl && main_ctl->connect_base)
+			event_base_loopbreak(main_ctl->connect_base);
+	}
 }
 
 /**
@@ -1553,10 +1945,21 @@ static void keep_control_alive()
 		return;
 	}
 
-	// Start ticker timer
-	schedule_heartbeat_timer(main_ctl->ticker_ping);
-	debug(LOG_DEBUG, "Control keepalive initialized successfully");
+	/* Schedule the first heartbeat after a short delay (1 second) instead
+	 * of the full heartbeat_interval (30s).  This ensures the server sees
+	 * activity promptly after login, preventing QUIC interop issues between
+	 * ngtcp2 and quic-go where the server may close the connection if no
+	 * application-level heartbeat arrives within the first 30 seconds.
+	 * The heartbeat_handler callback will reschedule at the normal interval. */
+	struct timeval tv = { 1, 0 };  /* 1 second initial delay */
+	if (event_add(main_ctl->ticker_ping, &tv) < 0) {
+		debug(LOG_ERR, "Failed to schedule initial heartbeat timer");
+	}
+	debug(LOG_DEBUG, "Control keepalive initialized (first heartbeat in 1s)");
 }
+
+/* Forward declaration — defined after init_server_connection */
+static void quic_connect_done_cb(struct bufferevent *bev, void *arg);
 
 /**
  * @brief Initializes a server connection and sets up the bufferevent
@@ -1579,7 +1982,28 @@ static int init_server_connection(struct bufferevent **bev_out,
 		*bev_out = NULL;
 	}
 
-	// Create new connection
+	struct common_conf *c_conf = get_common_config();
+
+	// QUIC transport — async handshake, bev delivered via callback
+	if (c_conf && c_conf->protocol && strcmp(c_conf->protocol, "quic") == 0) {
+		int quic_port = c_conf->quic_bind_port > 0 ?
+				c_conf->quic_bind_port : server_port;
+		debug(LOG_INFO, "Connecting to server [%s:%d] via QUIC...",
+		      server_addr, quic_port);
+		int rv = quic_connect_to_server(base, server_addr, quic_port,
+						quic_connect_done_cb, bev_out);
+		if (rv != 0) {
+			debug(LOG_ERR, "QUIC connection to [%s:%d] failed",
+			      server_addr, quic_port);
+			return -1;
+		}
+		/* bev_out will be populated by quic_connect_done_cb when handshake
+		 * completes.  Setup callbacks after it fires (in start_base_connect).
+		 * For now return success — the caller must defer callback setup. */
+		return 0;
+	}
+
+	// TCP/TLS transport (default)
 	*bev_out = connect_server(base, server_addr, server_port);
 	if (!*bev_out) {
 		debug(LOG_ERR, "Failed to connect to server [%s:%d]: [%d: %s]",
@@ -1621,6 +2045,41 @@ static int setup_server_callbacks(struct bufferevent *bev)
  * 
  * @note This function is static and can only be called from within the control.c file
  */
+/* QUIC handshake completion callback — called from qc_handshake_timer_cb
+ * when the QUIC handshake finishes (or fails).  Populates bev_out and
+ * sets up server callbacks + triggers login. */
+
+static void quic_connect_done_cb(struct bufferevent *bev, void *arg)
+{
+	struct bufferevent **bev_out = arg;
+
+	if (!bev) {
+		debug(LOG_ERR, "QUIC handshake failed");
+		/* Schedule a reconnect */
+		struct common_conf *c_conf = get_common_config();
+		if (c_conf) {
+			static int retry = 0;
+			handle_connection_failure(c_conf, &retry);
+		}
+		return;
+	}
+
+	*bev_out = bev;
+	main_ctl->connect_bev = bev;
+
+	/* Setup read/write/event callbacks on the new bev */
+	if (setup_server_callbacks(bev) != 0) {
+		debug(LOG_ERR, "QUIC: failed to setup server callbacks");
+		bufferevent_free(bev);
+		return;
+	}
+
+	/* BEV_EVENT_CONNECTED won't fire for a socketpair-backed bev,
+	 * so trigger login immediately. */
+	debug(LOG_INFO, "QUIC handshake complete, triggering login");
+	handle_connection_success(bev);
+}
+
 static void start_base_connect()
 {
 	struct common_conf *c_conf = get_common_config();
@@ -1635,6 +2094,15 @@ static void start_base_connect()
 							 c_conf->server_addr,
 							 c_conf->server_port) != 0) {
 		exit(1);
+	}
+
+	/* For QUIC transport, init_server_connection starts an async handshake.
+	 * The bev and callbacks are set up in quic_connect_done_cb when the
+	 * handshake completes.  For non-QUIC, set up immediately. */
+	if (c_conf->protocol && strcmp(c_conf->protocol, "quic") == 0) {
+		debug(LOG_INFO, "QUIC handshake started (async)");
+		/* connect_bev will be populated by quic_connect_done_cb */
+		return;
 	}
 
 	// Setup callbacks for the connection
@@ -1680,21 +2148,119 @@ static int prepare_login_message(char **msg_out, int *len_out) {
  *
  * @note This function does not take any parameters and does not return a value
  */
+static int v2_write_bytes(struct bufferevent *bev, struct tmux_stream *stream,
+			  const uint8_t *data, size_t len)
+{
+	struct common_conf *c_conf = get_common_config();
+	if (!bev)
+		bev = main_ctl->connect_bev;
+	if (!bev || !data || !len)
+		return -1;
+	if (c_conf->tcp_mux && stream) {
+		struct evbuffer *tmp = evbuffer_new();
+		if (!tmp)
+			return -1;
+		evbuffer_add(tmp, data, len);
+		int w = tmux_stream_write(bev, tmp, stream);
+		evbuffer_free(tmp);
+		bufferevent_flush(bev, EV_WRITE, BEV_FLUSH);
+		return w < 0 ? -1 : 0;
+	}
+	if (bufferevent_write(bev, data, len) < 0)
+		return -1;
+	bufferevent_flush(bev, EV_WRITE, BEV_FLUSH);
+	return 0;
+}
+
+static void v2_session_reset(void)
+{
+	SAFE_FREE(v2_ch_json);
+	v2_ch_json_len = 0;
+	v2_got_hello = 0;
+	v2_aead_ready = 0;
+	aead_writer_free(&v2_aw);
+	aead_reader_free(&v2_ar);
+}
+
+static int v2_send_login_handshake(void)
+{
+	struct common_conf *c_conf = get_common_config();
+	struct bufferevent *bev = main_ctl->connect_bev;
+	struct tmux_stream *st = &main_ctl->stream;
+	const char *proto = c_conf->protocol ? c_conf->protocol : "tcp";
+
+	uint8_t *hello_json = NULL;
+	size_t hj = 0;
+	if (wire_v2_build_client_hello_json(proto, c_conf->tls_enable,
+					    c_conf->tcp_mux, &hello_json, &hj) != 0) {
+		debug(LOG_ERR, "Failed to build v2 ClientHello");
+		return -1;
+	}
+	uint8_t *hello_frame = NULL;
+	size_t hf = 0;
+	if (wire_v2_encode_frame(WIRE_V2_FRAME_CLIENT_HELLO, hello_json,
+				 (uint32_t)hj, &hello_frame, &hf) != 0) {
+		free(hello_json);
+		return -1;
+	}
+	v2_ch_json = hello_json;
+	v2_ch_json_len = hj;
+
+	char *login_msg = NULL;
+	int msg_len = 0;
+	if (prepare_login_message(&login_msg, &msg_len) != 0) {
+		free(hello_frame);
+		return -1;
+	}
+	uint8_t *login_frame = NULL;
+	size_t lf = 0;
+	if (wire_v2_encode_message(TypeLogin, login_msg, (size_t)msg_len,
+				   &login_frame, &lf) != 0) {
+		SAFE_FREE(login_msg);
+		free(hello_frame);
+		return -1;
+	}
+	SAFE_FREE(login_msg);
+
+	size_t total = WIRE_V2_MAGIC_LEN + hf + lf;
+	uint8_t *blob = malloc(total);
+	if (!blob) {
+		free(hello_frame);
+		free(login_frame);
+		return -1;
+	}
+	memcpy(blob, WIRE_V2_MAGIC, WIRE_V2_MAGIC_LEN);
+	memcpy(blob + WIRE_V2_MAGIC_LEN, hello_frame, hf);
+	memcpy(blob + WIRE_V2_MAGIC_LEN + hf, login_frame, lf);
+	int rc = v2_write_bytes(bev, st, blob, total);
+	if (st)
+		st->v2_magic_sent = 1;
+	free(hello_frame);
+	free(login_frame);
+	free(blob);
+	debug(LOG_INFO, "Sent wire protocol v2 ClientHello + Login (%zu bytes)", total);
+	return rc;
+}
+
 void login(void) {
 	char *login_msg = NULL;
 	int msg_len = 0;
 
-	// Prepare login message
+	if (wire_protocol_is_v2()) {
+		if (v2_send_login_handshake() != 0) {
+			debug(LOG_ERR, "Failed to send v2 login handshake");
+			exit(1);
+		}
+		return;
+	}
+
 	if (prepare_login_message(&login_msg, &msg_len) != 0) {
 		debug(LOG_ERR, "Failed to prepare login message");
 		exit(1);
 	}
 
-	// Send login request
-	debug(LOG_DEBUG, "Sending login request: length=%d", msg_len);
 	send_msg_frp_server(NULL, TypeLogin, login_msg, msg_len, &main_ctl->stream);
 
-	// Cleanup
 	SAFE_FREE(login_msg);
 }
 
@@ -1752,16 +2318,45 @@ void send_msg_frp_server(struct bufferevent *bev,
 		return;
 	}
 
-	// Log debug info
-	debug(LOG_DEBUG, "Sending message: type=%d, len=%zu", type, msg_len);
-	if (msg) {
-		debug(LOG_DEBUG, "Message content: %s", msg);
-	}
-
 	// Prepare message
 	struct msg_hdr *req_msg = NULL;
 	size_t total_len = 0;
 	if (prepare_message(type, msg, msg_len, &req_msg, &total_len) != 0) {
+		return;
+	}
+
+	if (wire_protocol_is_v2()) {
+		uint8_t *frame = NULL;
+		size_t flen = 0;
+		if (wire_v2_encode_message(type, msg, msg_len, &frame, &flen) != 0) {
+			free(req_msg);
+			return;
+		}
+		size_t extra = 0;
+		if (stream && !stream->v2_magic_sent) {
+			extra = WIRE_V2_MAGIC_LEN;
+		}
+		uint8_t *blob = frame;
+		size_t blen = flen;
+		if (extra) {
+			blob = malloc(extra + flen);
+			if (!blob) {
+				free(frame);
+				free(req_msg);
+				return;
+			}
+			memcpy(blob, WIRE_V2_MAGIC, extra);
+			memcpy(blob + extra, frame, flen);
+			free(frame);
+			blen = extra + flen;
+			stream->v2_magic_sent = 1;
+		}
+		v2_write_bytes(bout, stream, blob, blen);
+		if (extra)
+			free(blob);
+		else
+			free(frame);
+		free(req_msg);
 		return;
 	}
 
@@ -1778,10 +2373,30 @@ void send_msg_frp_server(struct bufferevent *bev,
 			evbuffer_free(tmp);
 		}
 	} else {
-		if (bufferevent_write(bout, (uint8_t *)req_msg, total_len) < 0) {
-			debug(LOG_ERR, "Failed to write message directly"); 
+		/* For QUIC work streams the bev is backed by a socketpair whose
+		 * read end is serviced by the QUIC transport event callback.
+		 * bufferevent_flush only moves data into the socketpair buffer;
+		 * the QUIC transport won't pick it up until the next event-loop
+		 * iteration — by which time frps may have already sent FIN on
+		 * the stream (it accepted the stream but saw no data).  Writing
+		 * directly to the fd ensures the bytes land in the socketpair
+		 * immediately; the QUIC transport's sp_read_cb will fire in the
+		 * same event-loop pass as the incoming QUIC packets. */
+		struct common_conf *conf = get_common_config();
+		if (conf && conf->protocol && strcmp(conf->protocol, "quic") == 0
+		    && bev != main_ctl->connect_bev) {
+			evutil_socket_t fd = bufferevent_getfd(bout);
+			if (fd >= 0) {
+				ssize_t w = write(fd, req_msg, total_len);
+				if (w < 0)
+					debug(LOG_ERR, "QUIC work stream write: %s", strerror(errno));
+			}
 		} else {
-			bufferevent_flush(bout, EV_WRITE, BEV_FLUSH);
+			if (bufferevent_write(bout, (uint8_t *)req_msg, total_len) < 0) {
+				debug(LOG_ERR, "Failed to write message directly");
+			} else {
+				bufferevent_flush(bout, EV_WRITE, BEV_FLUSH);
+			}
 		}
 	}
 
@@ -1869,11 +2484,7 @@ static int initialize_encoder(struct bufferevent *bout, struct tmux_stream *stre
 			evbuffer_free(tmp);
 		}
 	} else {
-		if (bufferevent_write(bout, coder->iv, 16) < 0) {
-			debug(LOG_ERR, "Failed to write IV directly");
-			return -1;
-		}
-		bufferevent_flush(bout, EV_WRITE, BEV_FLUSH);
+		/* IV will be sent together with encrypted data in send_enc_msg_frp_server */
 	}
 	return 0;
 }
@@ -1896,6 +2507,24 @@ void send_enc_msg_frp_server(struct bufferevent *bev,
 	struct bufferevent *bout = bev ? bev : main_ctl->connect_bev;
 	if (!bout) {
 		debug(LOG_ERR, "No valid bufferevent");
+		return;
+	}
+
+	if (wire_protocol_is_v2()) {
+		uint8_t *frame = NULL;
+		size_t flen = 0;
+		if (wire_v2_encode_message(type, msg, msg_len, &frame, &flen) != 0)
+			return;
+		uint8_t *sealed = NULL;
+		size_t slen = 0;
+		if (!v2_got_hello || aead_writer_seal(&v2_aw, frame, flen, &sealed, &slen) != 0) {
+			debug(LOG_ERR, "v2 AEAD seal failed");
+			free(frame);
+			return;
+		}
+		free(frame);
+		v2_write_bytes(bout, stream, sealed, slen);
+		free(sealed);
 		return;
 	}
 
@@ -1924,11 +2553,44 @@ void send_enc_msg_frp_server(struct bufferevent *bev,
 			evbuffer_free(tmp);
 		}
 	} else {
-		if (bufferevent_write(bout, enc_msg, enc_len) < 0) {
-			debug(LOG_ERR, "Failed to write encrypted message directly");
-		} else {
-			bufferevent_flush(bout, EV_WRITE, BEV_FLUSH);
+		/* Write IV (first message only) + encrypted data as a single
+		 * atomic write to the socketpair.  The frps golib Reader only
+		 * reads the IV once — sending it with every message causes the
+		 * frps to treat the extra IV bytes as ciphertext, producing
+		 * garbage that crashes its readLoop. */
+		struct evbuffer *tmp = evbuffer_new();
+		struct frp_coder *enc = get_main_encoder();
+		if (!enc->iv_sent) {
+			evbuffer_add(tmp, enc->iv, 16);
+			enc->iv_sent = 1;
 		}
+		evbuffer_add(tmp, enc_msg, enc_len);
+		evutil_socket_t fd = bufferevent_getfd(bout);
+		if (fd >= 0) {
+			/* Drain fully: a partial write here would desynchronize
+			 * the server-side CFB keystream permanently. */
+			size_t expect = evbuffer_get_length(tmp);
+			int tries = 100;
+			while (evbuffer_get_length(tmp) > 0 && tries-- > 0) {
+				int w = evbuffer_write(tmp, fd);
+				if (w < 0) {
+					if (errno == EAGAIN || errno == EWOULDBLOCK) {
+						struct timespec ts = {0, 10 * 1000 * 1000};
+						nanosleep(&ts, NULL);
+						continue;
+					}
+					debug(LOG_ERR, "Failed to write encrypted message: %s",
+					      strerror(errno));
+					break;
+				}
+				if (w == 0)
+					break;
+			}
+			if (evbuffer_get_length(tmp) > 0)
+				debug(LOG_ERR, "Encrypted message truncated: wrote %zu of %zu bytes",
+				      expect - evbuffer_get_length(tmp), expect);
+		}
+		evbuffer_free(tmp);
 	}
 
 	free(enc_msg);
@@ -2086,7 +2748,7 @@ static int init_event_base(struct control *ctl)
  */
 static int init_dns_base(struct control *ctl)
 {
-	struct evdns_base *dnsbase = evdns_base_new(ctl->connect_base, 1);
+	struct evdns_base *dnsbase = evdns_base_new(ctl->connect_base, 0);
 	if (!dnsbase) {
 		debug(LOG_ERR, "Failed to create DNS base");
 		return -1;
@@ -2096,16 +2758,52 @@ static int init_dns_base(struct control *ctl)
 	evdns_base_set_option(dnsbase, "timeout", "1.0");
 	evdns_base_set_option(dnsbase, "randomize-case:", "0"); // Disable DNS-0x20 encoding
 
-	// Add DNS servers
-	const char *dns_servers[] = {
-		"180.76.76.76",    // Baidu DNS
-		"223.5.5.5",       // AliDNS
-		"223.6.6.6",       // AliDNS
-		"114.114.114.114"  // 114DNS
+	// Try system DNS from multiple locations
+	// OpenWrt stores upstream DNS in /tmp/resolv.conf.d/resolv.conf.auto,
+	// while standard Linux uses /etc/resolv.conf. Try both.
+	static const char *resolv_paths[] = {
+		"/tmp/resolv.conf.d/resolv.conf.auto",  /* OpenWrt upstream DNS */
+		"/tmp/resolv.conf",                       /* OpenWrt alternative */
+		"/etc/resolv.conf",                       /* Standard Linux */
 	};
 
-	for (size_t i = 0; i < sizeof(dns_servers)/sizeof(dns_servers[0]); i++) {
-		evdns_base_nameserver_ip_add(dnsbase, dns_servers[i]);
+	int dns_loaded = 0;
+	for (size_t i = 0; i < sizeof(resolv_paths)/sizeof(resolv_paths[0]); i++) {
+		if (access(resolv_paths[i], R_OK) == 0) {
+			if (evdns_base_resolv_conf_parse(dnsbase, DNS_OPTION_NAMESERVERS,
+			                                 resolv_paths[i]) >= 0 &&
+			    evdns_base_count_nameservers(dnsbase) > 0) {
+				debug(LOG_INFO, "Loaded DNS from %s", resolv_paths[i]);
+				dns_loaded = 1;
+				break;
+			}
+		}
+	}
+
+	// Filter out loopback nameservers (127.0.0.x) which point to local
+	// dnsmasq and may not resolve reliably for direct connections.
+	if (dns_loaded) {
+		// libevent does not expose a way to remove individual nameservers,
+		// but evdns_base_resolv_conf_parse skips 127.x automatically.
+		// If only loopback nameservers were found, treat as not loaded.
+		int count = evdns_base_count_nameservers(dnsbase);
+		if (count <= 0) {
+			dns_loaded = 0;
+		}
+	}
+
+	// Fallback to public DNS if system DNS unavailable
+	if (!dns_loaded) {
+		debug(LOG_INFO, "System DNS unavailable, using fallback DNS servers");
+		const char *fallback_dns[] = {
+			"223.5.5.5",       // AliDNS
+			"114.114.114.114", // 114DNS
+			"180.76.76.76",    // Baidu DNS
+		};
+
+		for (size_t i = 0; i < sizeof(fallback_dns)/sizeof(fallback_dns[0]); i++) {
+			evdns_base_nameserver_ip_add(dnsbase, fallback_dns[i]);
+		}
 	}
 
 	ctl->dnsbase = dnsbase;
@@ -2124,9 +2822,8 @@ static int init_dns_base(struct control *ctl)
 void init_main_control()
 {
 	// Clean up existing control if present
-	if (main_ctl && main_ctl->connect_base) {
-		event_base_loopbreak(main_ctl->connect_base);
-		free(main_ctl);
+	if (main_ctl) {
+		close_main_control();
 	}
 
 	// Allocate and initialize new control structure
@@ -2139,7 +2836,18 @@ void init_main_control()
 	// Initialize event base
 	if (init_event_base(main_ctl) != 0) {
 		free(main_ctl);
+		main_ctl = NULL;
 		exit(1);
+	}
+
+	/* Schedule periodic SIGHUP reload checker (500ms interval) */
+	main_ctl->reload_timer = evtimer_new(main_ctl->connect_base,
+			reload_check_timer_cb, NULL);
+	if (main_ctl->reload_timer) {
+		struct timeval tv = {0, 500 * 1000}; /* 500ms */
+		evtimer_add(main_ctl->reload_timer, &tv);
+	} else {
+		debug(LOG_ERR, "Failed to create reload timer");
 	}
 
 	// Initialize TCP multiplexing if enabled
@@ -2154,6 +2862,7 @@ void init_main_control()
 			debug(LOG_ERR, "Failed to initialize TLS");
 			event_base_free(main_ctl->connect_base);
 			free(main_ctl);
+			main_ctl = NULL;
 			exit(1);
 		}
 	}
@@ -2167,6 +2876,7 @@ void init_main_control()
 	if (init_dns_base(main_ctl) != 0) {
 		event_base_free(main_ctl->connect_base);
 		free(main_ctl);
+		main_ctl = NULL;
 		exit(1);
 	}
 }
@@ -2201,35 +2911,62 @@ static void clear_main_control()
 
 	// Clear event timers
 	if (main_ctl->ticker_ping) {
-		if (evtimer_del(main_ctl->ticker_ping) < 0) {
-			debug(LOG_ERR, "Failed to delete ticker ping timer");
-		}
+		evtimer_del(main_ctl->ticker_ping);
+		event_free(main_ctl->ticker_ping);
 		main_ctl->ticker_ping = NULL;
 	}
 
 	if (main_ctl->tcp_mux_ping_event) {
-		if (evtimer_del(main_ctl->tcp_mux_ping_event) < 0) {
-			debug(LOG_ERR, "Failed to delete TCP mux ping timer"); 
-		}
+		evtimer_del(main_ctl->tcp_mux_ping_event);
+		event_free(main_ctl->tcp_mux_ping_event);
 		main_ctl->tcp_mux_ping_event = NULL;
+	}
+
+	if (main_ctl->reload_timer) {
+		evtimer_del(main_ctl->reload_timer);
+		event_free(main_ctl->reload_timer);
+		main_ctl->reload_timer = NULL;
+	}
+
+	if (main_ctl->reconnect_timer) {
+		evtimer_del(main_ctl->reconnect_timer);
+		event_free(main_ctl->reconnect_timer);
+		main_ctl->reconnect_timer = NULL;
 	}
 
 	// Reset connection state
 	set_xfrpc_status(false);
 	is_login = 0;
 	pong_time = 0;
+	v2_session_reset();
+
+	// Reset TCP mux parser state (static variables in handle_tcp_mux)
+	handle_tcp_mux(NULL, 0, NULL);
 
 	// Clean up resources
+	health_check_stop_all();
 	clear_all_proxy_client();
 	free_crypto_resources();
 
-	// Reinitialize TCP multiplexing if enabled
-	struct common_conf *conf = get_common_config();
-	if (conf && conf->tcp_mux) {
-		uint32_t session_id = get_next_session_id();
-		init_tmux_stream(&main_ctl->stream, session_id, INIT);
-		debug(LOG_DEBUG, "Reinitialized TCP mux stream with session ID %u", session_id);
-	}
+        // Free QUIC/TCP connection bufferevent
+        if (main_ctl->connect_bev) {
+                bufferevent_free(main_ctl->connect_bev);
+                main_ctl->connect_bev = NULL;
+        }
+
+        // Reset QUIC connection state for clean reconnect
+#ifdef HAVE_NGTCP2
+        extern void quic_transport_reset(void);
+        quic_transport_reset();
+#endif
+
+        // Reinitialize TCP multiplexing if enabled
+        struct common_conf *conf = get_common_config();
+        if (conf && conf->tcp_mux) {
+                uint32_t session_id = get_next_session_id();
+                init_tmux_stream(&main_ctl->stream, session_id, INIT);
+                debug(LOG_DEBUG, "Reinitialized TCP mux stream with session ID %u", session_id);
+        }
 }
 
 /**
@@ -2240,6 +2977,93 @@ static void clear_main_control()
  *
  * @return void
  */
+/**
+ * @brief Hot-reload configuration on SIGHUP.
+ *
+ * This function is called from the event loop when a SIGHUP signal is received.
+ * It performs a graceful reload:
+ *  1. Stops all active visitor listeners and proxy tunnels
+ *  2. Frees old proxy service and visitor configurations
+ *  3. Reloads configuration from the same file
+ *  4. Re-registers new proxies with frps over the existing control connection
+ *  5. Restarts visitor listeners
+ *
+ * The control connection to frps is preserved — only proxy tunnels are recycled.
+ */
+/**
+ * @brief Callback for health check state transitions.
+ *
+ * When a proxy recovers from unhealthy to healthy, re-register it with frps.
+ */
+static void health_check_result_cb(struct proxy_service *ps, int healthy, void *ctx)
+{
+	(void)ctx;
+
+	if (!ps)
+		return;
+
+	if (healthy) {
+		/* Proxy recovered - re-register with frps */
+		if (is_xfrpc_connected()) {
+			debug(LOG_INFO, "Proxy [%s] recovered, re-registering with server", ps->proxy_name);
+			send_new_proxy(ps);
+		}
+	}
+}
+
+void reload_xfrpc_config(void)
+{
+	const char *config_file = get_config_file();
+	if (!config_file) {
+		debug(LOG_ERR, "Hot-reload failed: no config file path");
+		return;
+	}
+
+	debug(LOG_INFO, "=== SIGHUP received, reloading config from '%s' ===", config_file);
+
+	/* 1. Stop health checks, visitors, and proxy tunnels */
+	health_check_stop_all();
+	free_all_visitor_instances();
+	free_all_visitor_confs();
+	clear_all_proxy_client();
+
+	/* 2. Free old config structures */
+	free_all_proxy_services();
+	free_common_config();
+
+	/* 3. Reload config from file */
+	load_config(config_file);
+
+	/* 4. Re-register proxies with frps (if connected) */
+	if (is_xfrpc_connected()) {
+		start_proxy_services();
+	}
+
+	debug(LOG_INFO, "=== Hot-reload complete ===");
+}
+
+/**
+ * @brief Periodic timer callback that checks for pending SIGHUP reload.
+ *
+ * Runs every 500ms to minimize signal-to-reload latency while keeping
+ * overhead negligible.
+ */
+static void reload_check_timer_cb(evutil_socket_t fd, short what, void *ctx)
+{
+	(void)fd; (void)what;
+
+	if (check_reload_flag()) {
+		clear_reload_flag();
+		reload_xfrpc_config();
+	}
+
+	/* Re-arm the timer for the next check */
+	if (main_ctl && main_ctl->reload_timer) {
+		struct timeval tv = {0, 500 * 1000}; /* 500ms */
+		evtimer_add(main_ctl->reload_timer, &tv);
+	}
+}
+
 void close_main_control()
 {
 	if (!main_ctl) {
@@ -2252,10 +3076,6 @@ void close_main_control()
 
 	// Free event bases
 	if (main_ctl->connect_base) {
-		if (event_base_dispatch(main_ctl->connect_base) < 0) {
-			debug(LOG_ERR, "event_base_dispatch failed");
-		}
-
 		if (main_ctl->dnsbase) {
 			evdns_base_free(main_ctl->dnsbase, 0);
 			main_ctl->dnsbase = NULL;
@@ -2274,6 +3094,17 @@ void close_main_control()
 
 void run_control() 
 {
-	start_base_connect();
+	/* Reconnect loop: when reconnect_timer_cb fires, it sets
+	 * g_reconnect_requested and breaks the event loop.  We then
+	 * re-enter start_base_connect + event_base_dispatch. */
+	do {
+		g_reconnect_requested = 0;
+		start_base_connect();
+
+		/* Run the event loop — blocks until event_base_loopbreak() */
+		if (main_ctl && main_ctl->connect_base) {
+			event_base_dispatch(main_ctl->connect_base);
+		}
+	} while (g_reconnect_requested);
 }
 

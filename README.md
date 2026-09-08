@@ -10,23 +10,29 @@ The xfrpc project is an implementation of frp client written in C language for O
 
 xfrpc partially compitable with latest frp release feature, It targets to fully compatible with latest frp release.
 
-the following table is detail  compatible feature:
+the following table is detail  compatible feature (vs official frpc / frp v0.71):
 
-| Feature  | xfrpc | frpc |
+| Feature | xfrpc | frpc |
 | ------------- | ------------- | ---------|
-| tcp  | Yes |	 Yes  |
-| tcpmux  | Yes |	 Yes  |
-| http  | Yes |	 Yes  |
-| https  | Yes |  Yes  |
+| tcp | Yes | Yes |
+| tcpmux | Yes | Yes |
+| http | Yes | Yes |
+| https | Yes | Yes |
 | custom_domains | Yes | Yes |
 | subdomain | Yes | Yes |
-| socks5 | Yes | No |
-| use_encryption | No | Yes |
-| use_compression | No | Yes |
-| udp  | No |  Yes  |
-| p2p  | No |  Yes  |
-| xtcp  | No |  Yes  |
-| stcp  | No |  Yes  |
+| socks5 (proxy type) | Yes | plugin only |
+| use_encryption | Yes | Yes |
+| use_compression | Yes | Yes |
+| udp | Yes | Yes |
+| xtcp (P2P) | Yes | Yes |
+| stcp | Yes | Yes |
+| quic transport | Yes | Yes |
+| `transport.wireProtocol = v1` | Yes (default) | Yes |
+| `transport.wireProtocol = v2` | Yes (JSON messages + AES-256-GCM control AEAD) | Yes |
+| kcp / websocket / wss | No | Yes |
+| SUDP | Partial (config only) | Yes |
+| VirtualNet | No | Yes |
+| official plugins (http_proxy, static_file, tls2raw, …) | No | Yes |
 
 
 
@@ -36,82 +42,69 @@ the following table is detail  compatible feature:
 ![Architecture](https://user-images.githubusercontent.com/1182593/196329678-1781b4e9-2355-4863-be3f-e128b31cc82c.png)
 
 
-
-## Sequence Diagram
-
-```mermaid
-sequenceDiagram
-	title:	xfrpc与frps通信交互时序图
-	participant 本地服务
-	participant xfrpc
-  participant frps
-  participant 远程访问用户
-  
-  xfrpc ->> frps  : TypeLogin Message
-  frps ->> xfrpc  : TypeLoginResp Message
-  Note right of frps  : 根据Login信息里面的pool值，决定给xfrpc发送几条TypeReqWorkConn请求信息
-  frps ->> xfrpc  : frps aes-128-cfb iv[16] data
-  frps -->> xfrpc : TypeReqWorkConn Message
-	loop 根据Login中的PoolCount创建工作连接数
-  	xfrpc -->> frps  : TypeNewWorkConn Message
-  	Note left of xfrpc  : 与服务器创建代理服务工作连接，并请求新的工作连接请求
-  	Note right of frps  : 处理xfrpc端发送的TypeNewWorkConn消息，注册该工作连接到连接池中
-  	frps ->> xfrpc  : TypeStartWorkConn Message
-  	Note left of xfrpc  : 将新创建的工作连接与代理的本地服务连接做绑定
-	end
-  xfrpc ->> frps  : xfrpc aes-128-cfb iv[16] data
-  loop 用户配置的代理服务数
-  	xfrpc -->> frps : TypeNewProxy Message
-  	frps -->> xfrpc : NewProxyResp Message
-  end
-	
-  loop 心跳包检查
-    xfrpc -->> frps : TypePing Message
-    frps -->> xfrpc : TypePong Message
-  end
-  
-  远程访问用户 ->> frps   : 发起访问
-  frps ->> xfrpc	 : TypeStartWorkconn Message
-  loop  远程访问用户与本地服务之间的交互过程
-    frps ->> xfrpc         : 用户数据
-    xfrpc ->> 本地服务      : 用户数据
-    本地服务 ->> xfrpc      : 本地服务数据
-    xfrpc ->> frps         : 本地服务数据
-    frps  ->> 远程访问用户  : 本地服务数据
-  end
-  
-```
-
 ## How to build
 
 ### Build on Ubuntu 20.04.3 LTS
 
-To run xfrpc on Ubuntu 20.04 LTS, you will need to have the following libraries installed: libevent, openssl-dev, and json-c. Use the following command in your terminal to install these libraries:
+xfrpc requires libevent, json-c, and a TLS library (wolfSSL or OpenSSL).
+
+**Install dependencies on Ubuntu/Debian:**
 
 ```
 sudo apt-get update
 sudo apt-get install -y libjson-c-dev libevent-dev libssl-dev
 ```
 
-Once the required libraries are installed, you can download the xfrpc source code by forking the xfrpc repository on GitHub and then cloning it to your local machine using the following command:
+**Install dependencies on OpenWrt:**
+
+wolfSSL is the default TLS library on OpenWrt and is recommended. No additional TLS package is needed for basic functionality.
+
+**Build:**
 
 ```
-git clone https://github.com/${YOUR_GITHUB_ACCOUNT_NAME}/xfrpc.git
-```
-
-Navigate to the xfrp directory and create a build directory by using these commands:
-
-```
-cd xfrp
-mkdir build
-```
-Use the following commands to build and install xfrpc:
-
-```
+git clone https://github.com/liudf0716/xfrpc.git
+cd xfrpc
+mkdir build && cd build
 cmake ..
 make
 ```
+
+**Build options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `-DUSE_WOLFSSL=ON` | ON | Use wolfSSL as TLS backend (falls back to OpenSSL if not found) |
+| `-DENABLE_QUIC=ON` | OFF | Enable QUIC transport via ngtcp2 (requires ngtcp2 + nghttp3) |
+| `-DDEBUG=ON` | OFF | Enable debug build with address sanitizer |
+
+**Build with QUIC support:**
+
+```
+cmake .. -DENABLE_QUIC=ON
+make
+```
+
+**Build with OpenSSL instead of wolfSSL:**
+
+```
+cmake .. -DUSE_WOLFSSL=OFF
+make
+```
 This will compile xfrpc and create an executable in the build directory. You can then run xfrpc using the executable by running the appropriate command in terminal.
+
+### TLS Backend
+
+xfrpc uses **wolfSSL** as the default TLS backend, which is the standard TLS library on OpenWrt. wolfSSL is smaller, faster, and has native QUIC support compared to OpenSSL.
+
+On systems where wolfSSL is not installed, xfrpc automatically falls back to OpenSSL. You can explicitly choose the backend:
+
+```
+# Use wolfSSL (default, recommended)
+cmake .. -DUSE_WOLFSSL=ON
+
+# Use OpenSSL
+cmake .. -DUSE_WOLFSSL=OFF
+```
 
 ### Build static binary in Alpine container
 
@@ -179,6 +172,45 @@ local_port = 22
 remote_port = 6128
 ```
 
++ xfrpc quic transport support
+
+xfrpc can connect to frps using QUIC (UDP-based transport) instead of TCP. QUIC provides faster connection establishment (0-RTT), built-in encryption (TLS 1.3), and better performance on lossy networks.
+
+**frps configuration:**
+
+```
+# frps.ini
+[common]
+bind_port = 7000
+quicBindPort = 7000
+```
+
+**xfrpc configuration:**
+
+```
+# xfrpc_quic.ini
+[common]
+server_addr = your_server_ip
+server_port = 7000
+protocol = quic
+quic_bind_port = 7000
+
+[ssh]
+type = tcp
+local_ip = 127.0.0.1
+local_port = 22
+remote_port = 6128
+```
+
+**Configuration options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `protocol` | `tcp` | Transport protocol: `tcp` or `quic` |
+| `quic_bind_port` | 0 | frps QUIC listening port (required when protocol=quic) |
+
+> **Note:** QUIC support requires building with `-DENABLE_QUIC=ON` and the ngtcp2/nghttp3 libraries installed.
+
 This configuration tells the frp server (frps) to forward incoming connections on remote port 6128 to the xfrpc client. The xfrpc client, in turn, will forward these connections to the local service running on IP address 127.0.0.1 and port 22.
 
 + xfrpc tcpmux support
@@ -219,6 +251,83 @@ multiplexer = httpconnect
 ```
 
 Access `web.example.com:5000` or `api.your_server_domain:5000` to reach the local services through the TCPMux multiplexer.
+
++ xfrpc stcp support
+
+STCP (Secret TCP) proxy allows you to expose services privately without opening a public port on frps. Unlike tcp/udp proxies, STCP requires a preshared key (`sk`) for authentication — only visitors with the correct key can access the service. This is ideal for sensitive services like SSH, databases, or internal APIs that you don't want exposed to the public internet.
+
+**How it works:**
+
+STCP involves two xfrpc instances:
+1. **Service provider** (Machine B): Registers an STCP proxy with frps, specifying the local service to expose and a secret key.
+2. **Visitor** (Machine C): Connects to frps as a visitor, using the same secret key, and binds a local port that tunnels through to the remote service.
+
+The traffic flow is: `Machine C (visitor) → frps → Machine B (provider) → local service`
+
+**Step 1: frps server configuration**
+
+No special configuration needed for frps beyond the basic setup:
+
+```
+# frps.ini
+[common]
+bind_port = 7000
+```
+
+**Step 2: Service provider (Machine B) — expose a local service via STCP**
+
+```
+# xfrpc_stcp_server.ini
+[common]
+server_addr = your_server_ip
+server_port = 7000
+
+[secret_ssh]
+type = stcp
+local_ip = 127.0.0.1
+local_port = 22
+sk = my_secret_key_abc123
+# Allowed visitor users (default: same user only)
+# Use '*' to allow all users, or comma-separated list like 'user1, user2'
+allow_users = *
+```
+
+Key fields:
+- `type = stcp` — Use the STCP proxy type
+- `sk` — Preshared secret key (must match on both sides)
+- `allow_users` — Who can connect as a visitor (`*` = any user, or comma-separated usernames)
+
+**Step 3: Visitor (Machine C) — access the remote service**
+
+```
+# xfrpc_stcp_visitor.ini
+[common]
+server_addr = your_server_ip
+server_port = 7000
+
+[visitor:stcp_ssh_visitor]
+type = stcp
+server_name = secret_ssh
+sk = my_secret_key_abc123
+bind_addr = 127.0.0.1
+bind_port = 6000
+```
+
+Key fields:
+- `[visitor:name]` — Section prefix `visitor:` indicates this is a visitor configuration
+- `server_name` — Must match the proxy name on the provider side (`secret_ssh`)
+- `sk` — Must match the secret key on the provider side
+- `bind_addr` / `bind_port` — Local address and port to listen on for incoming connections
+
+**Step 4: Connect to the service**
+
+On Machine C, connect to the SSH service on Machine B through the visitor tunnel:
+
+```
+ssh -oPort=6000 127.0.0.1
+```
+
+> **Note:** When using `user` in the common section, both the provider and visitor xfrpc instances should use the same `user` value to ensure they are recognized as belonging to the same user group.
 
 + xfrpc http&https support
 
@@ -292,7 +401,7 @@ QQ群 ： [331230369](https://jq.qq.com/?_wv=1027&k=47QGEhL)
 
 ## Please support us and star our project
 
-[![Star History Chart](https://api.star-history.com/svg?repos=liudf0716/xfrpc&type=Date)](https://star-history.com/#liudf0716/xfrpc&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=liudf0716/xfrpc&type=Date)](https://star-history.dera.page/#liudf0716/xfrpc&Date)
 
 ## 打赏
 

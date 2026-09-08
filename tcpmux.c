@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <sys/uio.h>
 #include <netinet/tcp.h>
+#include <stdatomic.h>
 
 #include "client.h"
 #include "common.h"
@@ -56,7 +57,7 @@ static uint8_t local_go_away = 0;     /* Flag indicating local end wants to clos
 /**
  * @brief Session management variables
  */
-static uint32_t g_session_id = 1;     /* Global session ID counter (starts at 1) */
+static _Atomic uint32_t g_session_id = 1;     /* Global session ID counter (starts at 1) */
 
 /**
  * @brief Stream management variables
@@ -167,6 +168,11 @@ void init_tmux_stream(struct tmux_stream *stream, uint32_t id, enum tcp_mux_stat
     stream->state = state;
     stream->recv_window = MAX_STREAM_WINDOW_SIZE;  // 8MB
     stream->send_window = 256 * 1024;  // 256KB initial (matches yamux initialStreamWindow)
+    stream->v2_magic_sent = 0;
+    stream->v2_magic_seen = 0;
+    stream->v2_rx = NULL;
+    stream->v2_rx_len = 0;
+    stream->v2_rx_cap = 0;
 
     add_stream(stream);
     debug(LOG_DEBUG, "Initialized stream %u with state %d", id, state);
@@ -176,8 +182,12 @@ void init_tmux_stream(struct tmux_stream *stream, uint32_t id, enum tcp_mux_stat
  * @brief Releases per-stream temporary resources.
  */
 void tmux_stream_release(struct tmux_stream *stream) {
-    // tx_frame_buffer已移除，无需释放
-    (void)stream;
+    if (!stream)
+        return;
+    free(stream->v2_rx);
+    stream->v2_rx = NULL;
+    stream->v2_rx_len = 0;
+    stream->v2_rx_cap = 0;
 }
 
 /**
@@ -221,7 +231,7 @@ void tcp_mux_encode(enum tcp_mux_type type, enum tcp_mux_flag flags,
  */
 static uint32_t tcp_mux_flag() {
     static int cached = -1;
-    if (__builtin_expect(cached >= 0, 1))
+    if (cached >= 0)
         return cached;
     struct common_conf *c_conf = get_common_config();
     if (!c_conf) {
@@ -236,14 +246,14 @@ static uint32_t tcp_mux_flag() {
  * @brief Resets the global session ID to its initial value.
  */
 void reset_session_id() {
-    __atomic_store_n(&g_session_id, 1, __ATOMIC_SEQ_CST);
+    atomic_store(&g_session_id, 1);
 }
 
 /**
  * @brief Generates the next unique session ID.
  */
 uint32_t get_next_session_id() {
-    uint32_t current_id = __atomic_fetch_add(&g_session_id, 2, __ATOMIC_SEQ_CST);
+    uint32_t current_id = atomic_fetch_add(&g_session_id, 2);
     return current_id;
 }
 
@@ -362,7 +372,7 @@ void tcp_mux_send_data(struct bufferevent *bout, enum tcp_mux_flag flags,
 
     struct tcp_mux_header tmux_hdr;
     memset(&tmux_hdr, 0, sizeof(tmux_hdr));
-    tcp_mux_encode(DATA, flags, stream_id, length, &tmux_hdr);
+    tcp_mux_encode(TMUX_DATA, flags, stream_id, length, &tmux_hdr);
     
     if (bufferevent_write(bout, &tmux_hdr, sizeof(tmux_hdr)) < 0) {
         debug(LOG_ERR, "Failed to send data header for stream %u", stream_id);
@@ -542,7 +552,7 @@ void send_window_update(struct bufferevent *bout, struct tmux_stream *stream, ui
 }
 
 /**
- * @brief Processes data from a tmux DATA frame and dispatches to protocol handlers.
+ * @brief Processes data from a tmux TMUX_DATA frame and dispatches to protocol handlers.
  *
  * Reads the payload directly from the control bev (no intermediate ring buffer)
  * and dispatches to the appropriate protocol handler.
@@ -615,6 +625,41 @@ int process_data(struct bufferevent *bev, struct tmux_stream *stream,
         bytes_processed = length;
         debug(LOG_DEBUG, "Stream %u: leaving socks5 path processed=%u",
               stream_id, length);
+    } else if (is_udp_proxy(pc->ps)) {
+        /* UDP workConn carries TypeUDPPacket frames, not raw datagrams */
+        uint8_t *data = calloc(length + 1, sizeof(uint8_t));
+        if (!data) {
+            debug(LOG_ERR, "Memory allocation failed for UDP mux payload");
+            return 0;
+        }
+        size_t nr = bufferevent_read(bev, data, length);
+        if (nr != length) {
+            debug(LOG_ERR, "Stream %u: short read %zu/%u on UDP path",
+                  stream_id, nr, length);
+            free(data);
+            return 0;
+        }
+        handle_fn(data, length, pc);
+        free(data);
+        bytes_processed = length;
+    } else if (pc->use_encryption || pc->use_compression) {
+        /* Mux fast-path must decrypt/decompress before handing bytes to local */
+        struct evbuffer *src = bufferevent_get_input(bev);
+        struct evbuffer *frame = evbuffer_new();
+        struct evbuffer *plain = evbuffer_new();
+        if (!frame || !plain) {
+            if (frame) evbuffer_free(frame);
+            if (plain) evbuffer_free(plain);
+            debug(LOG_ERR, "Stream %u: failed to allocate crypto buffers", stream_id);
+            return 0;
+        }
+        evbuffer_remove_buffer(src, frame, length);
+        proxy_crypto_decode_evbuffer(pc, frame, plain);
+        struct evbuffer *dst = bufferevent_get_output(pc->local_proxy_bev);
+        evbuffer_add_buffer(dst, plain);
+        evbuffer_free(frame);
+        evbuffer_free(plain);
+        bytes_processed = length;
     } else {
         /* Ordinary local forwarding: zero-copy from control bev to local proxy bev */
         debug(LOG_DEBUG, "Stream %u: entering local proxy path length=%u local_proxy_bev=%p",
@@ -806,7 +851,7 @@ void handle_tcp_mux_go_away(struct tcp_mux_header *tmux_hdr) {
 /**
  * @brief Handles TCP multiplexing stream data and control messages (window updates only).
  *
- * With the rx_ring removed, DATA frames are handled directly in handle_tcp_mux
+ * With the rx_ring removed, TMUX_DATA frames are handled directly in handle_tcp_mux
  * by reading the payload from bev and calling process_data. This function now
  * only handles WINDOW_UPDATE messages and flag processing.
  */
@@ -894,7 +939,7 @@ int tmux_stream_write(struct bufferevent *bev,
 
     struct tcp_mux_header tmux_hdr;
     memset(&tmux_hdr, 0, sizeof(tmux_hdr));
-    tcp_mux_encode(DATA, flags, stream->id, to_send, &tmux_hdr);
+    tcp_mux_encode(TMUX_DATA, flags, stream->id, to_send, &tmux_hdr);
 
     // 1. 直接写header到out
     if (evbuffer_add(out, &tmux_hdr, sizeof(tmux_hdr)) < 0) {
