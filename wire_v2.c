@@ -222,14 +222,15 @@ static void transcript_part(EVP_MD_CTX *ctx, const char *label,
 	EVP_DigestUpdate(ctx, &z, 1);
 	EVP_DigestUpdate(ctx, label, strlen(label));
 	EVP_DigestUpdate(ctx, &z, 1);
-	lenbe[0] = (uint8_t)(plen >> 56);
-	lenbe[1] = (uint8_t)(plen >> 48);
-	lenbe[2] = (uint8_t)(plen >> 40);
-	lenbe[3] = (uint8_t)(plen >> 32);
-	lenbe[4] = (uint8_t)(plen >> 24);
-	lenbe[5] = (uint8_t)(plen >> 16);
-	lenbe[6] = (uint8_t)(plen >> 8);
-	lenbe[7] = (uint8_t)plen;
+	uint64_t plen64 = (uint64_t)plen;
+	lenbe[0] = (uint8_t)(plen64 >> 56);
+	lenbe[1] = (uint8_t)(plen64 >> 48);
+	lenbe[2] = (uint8_t)(plen64 >> 40);
+	lenbe[3] = (uint8_t)(plen64 >> 32);
+	lenbe[4] = (uint8_t)(plen64 >> 24);
+	lenbe[5] = (uint8_t)(plen64 >> 16);
+	lenbe[6] = (uint8_t)(plen64 >> 8);
+	lenbe[7] = (uint8_t)plen64;
 	EVP_DigestUpdate(ctx, lenbe, 8);
 	if (plen)
 		EVP_DigestUpdate(ctx, payload, plen);

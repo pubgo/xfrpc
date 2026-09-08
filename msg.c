@@ -194,7 +194,7 @@ char *get_auth_key(const char *token, time_t *timestamp)
 	// Create seed string
 	char seed[128] = {0};
 	int ret = snprintf(seed, sizeof(seed), "%s%jd", 
-					  token ? token : "", *timestamp);
+					  token ? token : "", (intmax_t)*timestamp);
 	if (ret < 0 || ret >= sizeof(seed)) {
 		return NULL;
 	}
