@@ -37,7 +37,9 @@ PROJECT_DIR = SCRIPT_DIR.parent.parent          # xfrpc repo root
 CONFIGS_DIR = SCRIPT_DIR / "configs"
 CERTS_DIR = SCRIPT_DIR / "certs"
 ECHO_SERVER_PY = SCRIPT_DIR / "tcp_echo_server.py"
-FRPS_BIN = Path("/home/liudf/work/frp/bin/frps")
+FRPS_BIN = Path(os.environ.get("FRPS_BIN", "/media/windows/github/xfrpc/build/frp_0.71.0_linux_amd64/frps"))
+if not FRPS_BIN.exists():
+    FRPS_BIN = Path("/home/liudf/work/frp/bin/frps")
 XFRC_BIN = PROJECT_DIR / "build" / "xfrpc"
 ECHO_PORT = 19001
 
